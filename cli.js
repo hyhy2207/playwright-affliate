@@ -5,8 +5,19 @@ const readline = require("readline");
 
 const { config } = require("./config");
 
-const POLL_INTERVAL_MS = 2000;
 const DONE_STATUSES = new Set(["success", "error"]);
+
+function formatDurationMs(durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs < 0) {
+    return null;
+  }
+
+  if (durationMs < 1000) {
+    return `${durationMs}ms`;
+  }
+
+  return `${(durationMs / 1000).toFixed(2)}s`;
+}
 
 function requestJson(method, path, body) {
   return new Promise((resolve, reject) => {
@@ -118,6 +129,20 @@ async function fetchTasks(status) {
 function printTaskSummary(task) {
   console.log(`[${task.status}] ${task.taskId}`);
 
+  const durationText = formatDurationMs(task.durationMs);
+  const queueText = formatDurationMs(task.queueMs);
+  const processingText = formatDurationMs(task.processingMs);
+
+  if (durationText) {
+    console.log(`- Tong thoi gian: ${durationText}`);
+  }
+  if (queueText) {
+    console.log(`- Cho worker: ${queueText}`);
+  }
+  if (processingText) {
+    console.log(`- Xu ly + lay JSON: ${processingText}`);
+  }
+
   if (task.result) {
     // console.log(`- Product: ${task.result.productName}`);
     // console.log(`- Shop: ${task.result.shopName}`);
@@ -211,7 +236,7 @@ async function pollTaskUntilDone(taskId) {
       return task;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    await new Promise((resolve) => setTimeout(resolve, config.taskPollMs));
   }
 }
 
@@ -286,12 +311,18 @@ async function handleInput(line) {
   }
 
   try {
+    const startedAtMs = Date.now();
     await ensureWorkerReady();
     const queuedTask = await submitScrape(input);
     console.log(`Da gui task: ${queuedTask.taskId}`);
     printTaskStatus(queuedTask);
 
     const finalTask = await pollTaskUntilDone(queuedTask.taskId);
+    const observedDurationMs = Date.now() - startedAtMs;
+    finalTask.durationMs =
+      Number.isFinite(finalTask.durationMs) && finalTask.durationMs > 0
+        ? finalTask.durationMs
+        : observedDurationMs;
     printTaskSummary(finalTask);
   } catch (error) {
     console.log(`Loi: ${error.message}`);

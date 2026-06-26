@@ -55,6 +55,8 @@ function createTaskStore() {
       raw: null,
       error: null,
       parseError: null,
+      startedAt: null,
+      endedAt: null,
       createdAt: timestamp,
       updatedAt: timestamp,
     };
@@ -84,6 +86,21 @@ function createTaskStore() {
       ...patch,
       updatedAt: nowIso(),
     };
+
+    if (
+      patch.status === TASK_STATUS.RUNNING &&
+      !current.startedAt &&
+      !patch.startedAt
+    ) {
+      nextTask.startedAt = nowIso();
+    }
+
+    if (
+      (patch.status === TASK_STATUS.SUCCESS || patch.status === TASK_STATUS.ERROR) &&
+      !patch.endedAt
+    ) {
+      nextTask.endedAt = nowIso();
+    }
 
     tasks.set(taskId, nextTask);
     return nextTask;

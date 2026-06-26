@@ -227,16 +227,23 @@ async function tryFetchAffiliateProductApi(page, itemId) {
 }
 
 async function handleTask(payload) {
-  const { taskId, url: requestUrl, itemId: rawItemId } = payload;
+  const {
+    taskId,
+    url: requestUrl,
+    itemId: payloadItemId,
+    item_id: payloadItemIdSnake,
+  } = payload;
   const itemId =
-    (typeof rawItemId === "string" && rawItemId.trim()) ||
+    (typeof payloadItemId === "string" && payloadItemId.trim()) ||
+    (typeof payloadItemIdSnake === "string" && payloadItemIdSnake.trim()) ||
     extractItemId(requestUrl);
+  const requestRef = requestUrl || itemId;
 
   if (!itemId) {
     sendSocketMessage({
       type: "ERROR",
       taskId,
-      requestUrl,
+      requestUrl: requestRef,
       message: "Khong tim thay item_id trong URL",
     });
     return;
@@ -246,7 +253,7 @@ async function handleTask(payload) {
   sendSocketMessage({
     type: "STARTED",
     taskId,
-    requestUrl,
+    requestUrl: requestRef,
     message: `Dang xu ly item_id ${itemId}`,
   });
 
@@ -283,7 +290,7 @@ async function handleTask(payload) {
       );
 
       await page.goto(affiliateUrl, {
-        waitUntil: "domcontentloaded",
+        waitUntil: "commit",
         timeout: config.scrapeTimeoutMs,
       });
       await waitForAffiliatePageSettled(page);
@@ -322,6 +329,7 @@ async function handleTask(payload) {
       type: "ERROR",
       taskId,
       url: affiliateUrl,
+      requestUrl: requestRef,
       message: error.message,
     });
   }
@@ -421,7 +429,10 @@ function connectSocket() {
         return;
       }
 
-      if (payload.url && payload.taskId) {
+      if (
+        payload.taskId &&
+        (payload.url || payload.itemId || payload.item_id)
+      ) {
         enqueueTask(payload);
       }
     } catch (error) {
