@@ -151,6 +151,7 @@ function normalizeShopeeProduct(rawData) {
     minPrice,
     maxPrice,
     sales: toNumber(item.sold ?? item.sales ?? item.historical_sold),
+    totalSales: toNumber(item.historical_sold ?? item.sold ?? item.sales),
     rating: Number(
       item.item_rating?.rating_star || item.rating_star || item.rating || 0
     ).toFixed(2),
@@ -336,9 +337,26 @@ function cleanupExpiredTasks() {
   }
 }
 
+function toTimeMs(value) {
+  return value ? new Date(value).getTime() : 0;
+}
+
 function buildTaskResponse(task) {
+  const createdAtMs = toTimeMs(task.createdAt);
+  const startedAtMs = toTimeMs(task.startedAt);
+  const endedAtMs = toTimeMs(task.endedAt);
+  const updatedAtMs = toTimeMs(task.updatedAt);
+  const finishMs = endedAtMs || updatedAtMs;
+  const durationMs =
+    createdAtMs > 0 && finishMs >= createdAtMs ? finishMs - createdAtMs : null;
+  const queueMs =
+    createdAtMs > 0 && startedAtMs >= createdAtMs ? startedAtMs - createdAtMs : null;
+  const processingMs =
+    startedAtMs > 0 && finishMs >= startedAtMs ? finishMs - startedAtMs : null;
+
   return {
     taskId: task.taskId,
+    itemId: /^\d+$/.test(String(task.requestUrl || "")) ? String(task.requestUrl) : null,
     status: task.status,
     requestUrl: task.requestUrl,
     affiliateUrl: task.affiliateUrl,
@@ -346,6 +364,11 @@ function buildTaskResponse(task) {
     raw: task.raw,
     error: task.error,
     parseError: task.parseError,
+    startedAt: task.startedAt,
+    endedAt: task.endedAt,
+    durationMs,
+    queueMs,
+    processingMs,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
   };
@@ -604,7 +627,15 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    if ((payload.url || payload.itemId) && !payload.data) {
+    const normalizedItemId =
+      typeof payload.itemId === "string" && payload.itemId.trim()
+        ? payload.itemId.trim()
+        : typeof payload.item_id === "string" && payload.item_id.trim()
+          ? payload.item_id.trim()
+          : "";
+
+    if ((payload.url || normalizedItemId) && !payload.data) {
+      payload.itemId = normalizedItemId;
       const result = enqueueTaskForWorker(payload, ws);
       if (!result.ok) {
         sendJson(ws, result.error);
@@ -612,7 +643,7 @@ wss.on("connection", (ws) => {
           clientId: ws.meta?.clientId,
           reason: result.error.message,
           taskId: payload.taskId || null,
-          requestUrl: payload.url || payload.itemId || null,
+          requestUrl: payload.url || normalizedItemId || null,
           statusCode: result.statusCode,
         });
       }
