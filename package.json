@@ -1,0 +1,27 @@
+{
+  "name": "playwright-shopee",
+  "version": "1.0.0",
+  "description": "Shopee affiliate scraper using Playwright persistent profile",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "cli": "node cli.js",
+    "worker": "node playwright-worker.js",
+    "stack": "node stack.js",
+    "login": "node worker-login.js",
+    "check": "node --check server.js && node --check cli.js && node --check config.js && node --check logger.js && node --check validation.js && node --check task-store.js && node --check playwright-worker.js && node --check worker-login.js && node --check stack.js"
+  },
+  "keywords": [
+    "playwright",
+    "shopee",
+    "affiliate",
+    "crawler"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "playwright": "^1.54.2",
+    "ws": "^8.21.0"
+  }
+}
