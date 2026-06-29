@@ -16,6 +16,10 @@ Ban nay la huong di song song voi `extension-shopee`, nhung thay worker Chrome E
 - `worker-login.js`: mo profile de login thu cong
 - `cli.js`: prompt `>` de paste link Shopee
 
+Tai lieu source chi tiet:
+
+- `docs/source-guide.md`: kien truc, logic xu ly, parser JSON, timing, loi hay gap, phuong an phat trien.
+
 ## Cai dat
 
 ```bash
@@ -24,15 +28,50 @@ npm install
 cp .env.example .env
 ```
 
+## PostgreSQL
+
+Giai doan 1 dung PostgreSQL de luu product/raw/history. Tao database local:
+
+```bash
+createdb playwright_shopee
+```
+
+Hoac neu dung user/password rieng, sua trong `.env`:
+
+```bash
+PRODUCT_STORE_DRIVER=postgres
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/playwright_shopee
+DATABASE_SSL=false
+```
+
+Khi `npm run api` hoac `npm run stack`, server se tu tao bang:
+
+- `products`: product JSON moi nhat theo `itemId`.
+- `price_history`: lich su gia/commission moi lan crawl thanh cong.
+
 ## Config quan trong
 
 ```bash
 PORT=8080
 LOG_DIR=logs
 TASK_LOG_FILE=tasks.jsonl
+LOG_MAX_BYTES=10485760
 TASK_RETENTION_MS=1800000
+TASK_QUEUE_TIMEOUT_MS=10000
+TASK_TIMEOUT_MS=15000
+PRODUCT_CACHE_TTL_MS=300000
+PRODUCT_REQUEST_TIMEOUT_MS=10000
+PRODUCT_BATCH_LIMIT=20
+PRODUCT_STORE_DRIVER=postgres
+PRODUCT_DATA_DIR=data
+PRODUCT_STORE_FILE=products.json
+PRODUCT_HISTORY_FILE=price-history.jsonl
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/playwright_shopee
+DATABASE_SSL=false
 WORKER_WAIT_TIMEOUT_MS=30000
 WORKER_WAIT_POLL_MS=500
+SERVICE_AUTO_RESTART=true
+SERVICE_RESTART_DELAY_MS=2000
 TASK_POLL_MS=200
 WORKER_SOCKET_URL=ws://127.0.0.1:8080
 BROWSER_PROFILE_DIR=.browser-profile
@@ -169,6 +208,28 @@ hoac
 57458114650
 ```
 
+Neu muon chay API nen, khong mo CLI:
+
+```bash
+npm run api
+```
+
+Lenh nay se:
+
+- Kiem tra/mo Chrome CDP neu `BROWSER_CDP_URL` duoc set.
+- Khoi dong HTTP server.
+- Khoi dong Playwright worker.
+- Tu restart server/worker neu process bi crash.
+- Khong mo prompt CLI, phu hop de tool khac goi HTTP API.
+
+Neu co PM2:
+
+```bash
+pm2 start ecosystem.config.js
+pm2 logs playwright-shopee-api
+pm2 restart playwright-shopee-api
+```
+
 ---
 
 # HTTP API
@@ -199,6 +260,64 @@ Lay chi tiet task:
 
 ```bash
 curl http://localhost:8080/tasks/<task-id>
+```
+
+Lay nhanh theo item id, co cache:
+
+```bash
+curl "http://localhost:8080/product/57458114650"
+```
+
+Ep crawl lai, bo qua cache/DB:
+
+```bash
+curl "http://localhost:8080/product/57458114650?refresh=1"
+```
+
+Chon format ket qua:
+
+```bash
+curl "http://localhost:8080/product/57458114650?mode=compact"
+curl "http://localhost:8080/product/57458114650?mode=full"
+curl "http://localhost:8080/product/57458114650?mode=raw"
+```
+
+Lay danh sach product da luu trong PostgreSQL:
+
+```bash
+curl "http://localhost:8080/products?limit=20&offset=0"
+```
+
+Lay lich su gia/commission:
+
+```bash
+curl "http://localhost:8080/products/57458114650/history?limit=100"
+```
+
+Lay nhieu product mot lan:
+
+```bash
+curl -X POST http://localhost:8080/products/batch \
+  -H "Content-Type: application/json" \
+  -d '{"itemIds":["57458114650","20300919760"],"mode":"compact"}'
+```
+
+Kiem tra session worker/CDP/cache:
+
+```bash
+curl http://localhost:8080/session
+```
+
+Huy task dang queued/running:
+
+```bash
+curl -X POST http://localhost:8080/tasks/<task-id>/cancel
+```
+
+Xoa task khoi RAM:
+
+```bash
+curl -X DELETE http://localhost:8080/tasks/<task-id>
 ```
 
 ---

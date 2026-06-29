@@ -41,6 +41,49 @@ function createTaskStore() {
     return removed;
   }
 
+  function timeoutStuckTasks() {
+    const now = nowMs();
+    const timedOut = [];
+
+    for (const [taskId, task] of tasks.entries()) {
+      if (task.status === TASK_STATUS.QUEUED) {
+        const createdAtMs = toTimeMs(task.createdAt);
+        if (createdAtMs > 0 && now - createdAtMs >= config.taskQueueTimeoutMs) {
+          const timestamp = nowIso();
+          const nextTask = {
+            ...task,
+            status: TASK_STATUS.ERROR,
+            errorCode: "TASK_QUEUE_TIMEOUT",
+            error: `Task queued qua ${config.taskQueueTimeoutMs}ms ma worker chua bat dau`,
+            endedAt: timestamp,
+            updatedAt: timestamp,
+          };
+          tasks.set(taskId, nextTask);
+          timedOut.push(nextTask);
+        }
+      }
+
+      if (task.status === TASK_STATUS.RUNNING) {
+        const startedAtMs = toTimeMs(task.startedAt || task.updatedAt);
+        if (startedAtMs > 0 && now - startedAtMs >= config.taskTimeoutMs) {
+          const timestamp = nowIso();
+          const nextTask = {
+            ...task,
+            status: TASK_STATUS.ERROR,
+            errorCode: "TASK_TIMEOUT",
+            error: `Task running qua ${config.taskTimeoutMs}ms ma chua co ket qua`,
+            endedAt: timestamp,
+            updatedAt: timestamp,
+          };
+          tasks.set(taskId, nextTask);
+          timedOut.push(nextTask);
+        }
+      }
+    }
+
+    return timedOut;
+  }
+
   function createTask({ taskId, requestUrl, requesterClientId = null, status = TASK_STATUS.QUEUED }) {
     cleanupExpiredTasks();
 
@@ -54,6 +97,7 @@ function createTaskStore() {
       result: null,
       raw: null,
       error: null,
+      errorCode: null,
       parseError: null,
       startedAt: null,
       endedAt: null,
@@ -132,6 +176,7 @@ function createTaskStore() {
     removeTask,
     listTasks,
     cleanupExpiredTasks,
+    timeoutStuckTasks,
     size() {
       cleanupExpiredTasks();
       return tasks.size;

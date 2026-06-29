@@ -49,6 +49,64 @@ function sendSocketMessage(payload) {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function classifyWorkerError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+
+  if (
+    message.includes("econnrefused") ||
+    message.includes("connectovercdp") ||
+    message.includes("browser has been closed") ||
+    message.includes("target page, context or browser has been closed")
+  ) {
+    return "CDP_DISCONNECTED";
+  }
+
+  if (message.includes("loading issue") || message.includes("loi tai") || message.includes("lỗi tải")) {
+    return "LOADING_ISSUE";
+  }
+
+  if (
+    message.includes("captcha") ||
+    message.includes("verify/captcha") ||
+    message.includes("dang chan") ||
+    message.includes("bị chặn") ||
+    message.includes("bi chan") ||
+    message.includes("block")
+  ) {
+    return "CAPTCHA_REQUIRED";
+  }
+
+  if (
+    message.includes("chua login") ||
+    message.includes("chưa login") ||
+    message.includes("login affiliate") ||
+    message.includes("mat session") ||
+    message.includes("mất session") ||
+    message.includes("logged out")
+  ) {
+    return "LOGIN_REQUIRED";
+  }
+
+  return "WORKER_ERROR";
+}
+
+function sendSessionStatus(patch) {
+  sendSocketMessage({
+    type: "SESSION_STATUS",
+    workerReady: false,
+    affiliateLoggedIn: false,
+    currentUrl: null,
+    mode: null,
+    profileDir: config.browserProfileDir,
+    message: null,
+    ...patch,
+  });
+}
+
 async function getBrowserContext() {
   if (!browserSessionPromise) {
     browserSessionPromise = launchBrowserContext();
@@ -135,6 +193,13 @@ async function ensureProfileLoggedIn() {
       mode: browserSession.mode,
       profileDir: config.browserProfileDir,
     });
+    sendSessionStatus({
+      workerReady: true,
+      affiliateLoggedIn: true,
+      currentUrl,
+      mode: browserSession.mode,
+      message: "Profile affiliate san sang",
+    });
   } finally {
     if (shouldClosePage) {
       await page.close().catch(() => {});
@@ -148,7 +213,9 @@ function buildAffiliateUrl(itemId) {
 }
 
 async function tryFetchAffiliateProductApi(page, itemId) {
+  const startedAt = Date.now();
   const base = config.affiliateBaseUrl.replace(/\/$/, "");
+  const attempts = [];
   const candidates = [
     {
       url: `${base}/api/v3/offer/product?item_id=${encodeURIComponent(itemId)}`,
@@ -174,56 +241,85 @@ async function tryFetchAffiliateProductApi(page, itemId) {
     },
   ];
 
-  for (const candidate of candidates) {
-    const result = await page
-      .evaluate(async ({ url, options }) => {
-        try {
-          const response = await fetch(url, options);
-          const text = await response.text();
+  for (let round = 1; round <= 2; round++) {
+    for (const candidate of candidates) {
+      const attemptStartedAt = Date.now();
+      const result = await page
+        .evaluate(async ({ url, options }) => {
+          try {
+            const response = await fetch(url, options);
+            const text = await response.text();
+            return {
+              ok: response.ok,
+              status: response.status,
+              text,
+              url,
+            };
+          } catch (error) {
+            return {
+              ok: false,
+              status: 0,
+              text: "",
+              url,
+              error: error?.message || String(error),
+            };
+          }
+        }, candidate)
+        .catch((error) => ({
+          ok: false,
+          status: 0,
+          text: "",
+          url: candidate.url,
+          error: error.message,
+        }));
+
+      attempts.push({
+        round,
+        method: candidate.options.method,
+        status: result.status,
+        ok: result.ok,
+        ms: Date.now() - attemptStartedAt,
+        error: result.error || null,
+      });
+
+      if (!result.ok || !result.text) {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(result.text);
+        const responseItemId = String(
+          parsed?.data?.item_id ??
+            parsed?.data?.itemId ??
+            parsed?.data?.batch_item_for_item_card_full?.itemid ??
+            ""
+        );
+
+        if (parsed?.code === 0 && responseItemId === String(itemId)) {
           return {
-            ok: response.ok,
-            status: response.status,
-            text,
-            url,
-          };
-        } catch (error) {
-          return {
-            ok: false,
-            status: 0,
-            text: "",
-            url,
-            error: error?.message || String(error),
+            ok: true,
+            body: result.text,
+            apiFetchMs: Date.now() - startedAt,
+            attempts,
           };
         }
-      }, candidate)
-      .catch((error) => ({
-        ok: false,
-        status: 0,
-        text: "",
-        url: candidate.url,
-        error: error.message,
-      }));
-
-    if (!result.ok || !result.text) {
-      continue;
+      } catch (error) {
+        attempts[attempts.length - 1].error = error.message;
+      }
     }
 
-    try {
-      const parsed = JSON.parse(result.text);
-      const responseItemId = String(
-        parsed?.data?.item_id ??
-          parsed?.data?.itemId ??
-          parsed?.data?.batch_item_for_item_card_full?.itemid ??
-          ""
-      );
-
-      if (parsed?.code === 0 && responseItemId === String(itemId)) {
-        return result.text;
-      }
-    } catch {}
+    if (round === 1) {
+      await sleep(120);
+    }
   }
 
-  return null;
+  return {
+    ok: false,
+    body: null,
+    apiFetchMs: Date.now() - startedAt,
+    attempts,
+    reason: attempts.length > 0 ? "no_valid_api_response" : "no_attempt",
+  };
 }
 
 async function handleTask(payload) {
@@ -231,11 +327,9 @@ async function handleTask(payload) {
     taskId,
     url: requestUrl,
     itemId: payloadItemId,
-    item_id: payloadItemIdSnake,
   } = payload;
   const itemId =
     (typeof payloadItemId === "string" && payloadItemId.trim()) ||
-    (typeof payloadItemIdSnake === "string" && payloadItemIdSnake.trim()) ||
     extractItemId(requestUrl);
   const requestRef = requestUrl || itemId;
 
@@ -244,7 +338,8 @@ async function handleTask(payload) {
       type: "ERROR",
       taskId,
       requestUrl: requestRef,
-      message: "Khong tim thay item_id trong URL",
+      code: "INVALID_ITEM_ID",
+      message: "Khong tim thay itemId trong URL/input",
     });
     return;
   }
@@ -260,9 +355,10 @@ async function handleTask(payload) {
   try {
     const browserSession = await getBrowserSession();
     const page = await getActiveTaskPage(browserSession);
+    let requestFailedHandler = null;
 
     try {
-      const requestFailedHandler = (request) => {
+      requestFailedHandler = (request) => {
         if (!request.url().includes("affiliate.shopee.vn")) return;
         logger.warn("worker.request_failed", {
           taskId,
@@ -272,17 +368,32 @@ async function handleTask(payload) {
       };
       page.on("requestfailed", requestFailedHandler);
 
-      const fastApiBody = await tryFetchAffiliateProductApi(page, itemId);
-      if (fastApiBody) {
+      const fastApiResult = await tryFetchAffiliateProductApi(page, itemId);
+      if (fastApiResult.ok) {
+        logger.info("worker.fast_api_hit", {
+          taskId,
+          itemId,
+          apiFetchMs: fastApiResult.apiFetchMs,
+          attempts: fastApiResult.attempts,
+        });
         sendSocketMessage({
           type: "SUCCESS",
           taskId,
           url: affiliateUrl,
-          data: fastApiBody,
+          data: fastApiResult.body,
         });
         return;
       }
 
+      logger.warn("worker.fast_api_fallback", {
+        taskId,
+        itemId,
+        apiFetchMs: fastApiResult.apiFetchMs,
+        reason: fastApiResult.reason,
+        attempts: fastApiResult.attempts,
+      });
+
+      const gotoStartedAt = Date.now();
       const responsePromise = page.waitForResponse(
         (response) =>
           response.url().includes(TARGET_API_PATH) && response.status() < 500,
@@ -314,6 +425,14 @@ async function handleTask(payload) {
         );
       }
       const body = await response.text();
+      const gotoMs = Date.now() - gotoStartedAt;
+
+      logger.info("worker.fallback_goto", {
+        taskId,
+        itemId,
+        gotoMs,
+        responseStatus: response.status(),
+      });
 
       sendSocketMessage({
         type: "SUCCESS",
@@ -322,14 +441,18 @@ async function handleTask(payload) {
         data: body,
       });
     } finally {
-      page.off("requestfailed", requestFailedHandler);
+      if (requestFailedHandler) {
+        page.off("requestfailed", requestFailedHandler);
+      }
     }
   } catch (error) {
+    const code = classifyWorkerError(error);
     sendSocketMessage({
       type: "ERROR",
       taskId,
       url: affiliateUrl,
       requestUrl: requestRef,
+      code,
       message: error.message,
     });
   }
@@ -365,7 +488,17 @@ function scheduleWorkerRegistration() {
 
 function tryRegisterWorker() {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  if (isRegisteringWorker || hasValidatedProfile) return;
+  if (isRegisteringWorker) return;
+
+  if (hasValidatedProfile) {
+    sendSocketMessage({ type: "REGISTER_WORKER" });
+    sendSessionStatus({
+      workerReady: true,
+      affiliateLoggedIn: true,
+      message: "Profile affiliate da validate truoc do",
+    });
+    return;
+  }
 
   isRegisteringWorker = true;
   ensureProfileLoggedIn()
@@ -376,6 +509,12 @@ function tryRegisterWorker() {
     .catch((error) => {
       logger.error("worker.login_required", {
         message: error.message,
+      });
+      sendSessionStatus({
+        workerReady: false,
+        affiliateLoggedIn: false,
+        message: error.message,
+        errorCode: classifyWorkerError(error),
       });
       scheduleWorkerRegistration();
     })
@@ -431,7 +570,7 @@ function connectSocket() {
 
       if (
         payload.taskId &&
-        (payload.url || payload.itemId || payload.item_id)
+        (payload.url || payload.itemId)
       ) {
         enqueueTask(payload);
       }

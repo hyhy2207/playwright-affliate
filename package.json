@@ -9,8 +9,9 @@
     "cli": "node cli.js",
     "worker": "node playwright-worker.js",
     "stack": "node stack.js",
+    "api": "node api-stack.js",
     "login": "node worker-login.js",
-    "check": "node --check server.js && node --check cli.js && node --check config.js && node --check logger.js && node --check validation.js && node --check task-store.js && node --check playwright-worker.js && node --check worker-login.js && node --check stack.js"
+    "check": "node --check server.js && node --check cli.js && node --check config.js && node --check logger.js && node --check validation.js && node --check task-store.js && node --check product-store.js && node --check playwright-worker.js && node --check worker-login.js && node --check stack.js && node --check api-stack.js"
   },
   "keywords": [
     "playwright",
@@ -21,6 +22,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "pg": "^8.16.3",
     "playwright": "^1.54.2",
     "ws": "^8.21.0"
   }

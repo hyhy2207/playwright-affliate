@@ -9,6 +9,7 @@ const WebSocket = require("ws");
 
 const { config } = require("./config");
 const { logger } = require("./logger");
+const { productStore } = require("./product-store");
 const { taskStore, TASK_STATUS } = require("./task-store");
 const {
   isValidItemId,
@@ -19,6 +20,19 @@ const {
 let nextClientId = 1;
 
 const requesterSockets = new Map();
+const productCache = new Map();
+
+let latestWorkerSession = {
+  workerReady: false,
+  affiliateLoggedIn: false,
+  currentUrl: null,
+  mode: null,
+  profileDir: null,
+  message: null,
+  updatedAt: null,
+};
+
+const PRODUCT_OUTPUT_MODES = new Set(["compact", "full", "raw"]);
 
 function toNumber(value, fallback = 0) {
   const numeric =
@@ -173,6 +187,283 @@ function normalizeShopeeProduct(rawData) {
   return product;
 }
 
+function parseRawJson(rawData) {
+  if (typeof rawData !== "string") return rawData;
+
+  try {
+    return JSON.parse(rawData);
+  } catch {
+    return rawData;
+  }
+}
+
+function normalizeOutputMode(value) {
+  const mode = String(value || "compact").trim().toLowerCase();
+  return PRODUCT_OUTPUT_MODES.has(mode) ? mode : "compact";
+}
+
+function extractItemIdFromInput(value) {
+  const input = String(value || "").trim();
+  if (!input) return "";
+  if (isValidItemId(input)) return input;
+
+  const pathMatch = input.match(/\/product\/\d+\/(\d+)/);
+  if (pathMatch?.[1]) return pathMatch[1];
+
+  const seoMatch = input.match(/i\.\d+\.(\d+)/);
+  if (seoMatch?.[1]) return seoMatch[1];
+
+  try {
+    const parsed = new URL(input);
+    return parsed.searchParams.get("item_id") || "";
+  } catch {
+    return "";
+  }
+}
+
+function getRequestItemId(payload) {
+  return extractItemIdFromInput(payload.itemId || payload.url || "");
+}
+
+function getCachedProduct(itemId) {
+  const cached = productCache.get(String(itemId || ""));
+  if (!cached) return null;
+
+  if (Date.now() - cached.cachedAtMs > config.productCacheTtlMs) {
+    productCache.delete(String(itemId));
+    return null;
+  }
+
+  return cached;
+}
+
+function buildStoreProductEntry(record) {
+  if (!record) return null;
+
+  return {
+    itemId: String(record.itemId),
+    result: record.result,
+    raw: record.raw,
+    affiliateUrl: record.affiliateUrl,
+    cachedAt: record.updatedAt,
+    cachedAtMs: record.updatedAt ? new Date(record.updatedAt).getTime() : Date.now(),
+  };
+}
+
+function setCachedProduct(product, raw, affiliateUrl) {
+  if (!product?.productID) return;
+
+  productCache.set(String(product.productID), {
+    itemId: String(product.productID),
+    result: product,
+    raw,
+    affiliateUrl,
+    cachedAt: new Date().toISOString(),
+    cachedAtMs: Date.now(),
+  });
+}
+
+async function persistProduct(product, raw, affiliateUrl, source = "worker") {
+  try {
+    await productStore.upsertProduct({
+      product,
+      raw,
+      affiliateUrl,
+      source,
+    });
+  } catch (error) {
+    logger.warn("product_store.upsert_failed", {
+      itemId: product?.productID || null,
+      message: error.message,
+    });
+  }
+}
+
+function buildProductPayload(entry, mode = "compact") {
+  const normalizedMode = normalizeOutputMode(mode);
+
+  if (normalizedMode === "raw") {
+    return parseRawJson(entry.raw);
+  }
+
+  if (normalizedMode === "full") {
+    return {
+      ...entry.result,
+      raw: parseRawJson(entry.raw),
+      cache: entry.cachedAt
+        ? {
+            itemId: entry.itemId,
+            cachedAt: entry.cachedAt,
+            ttlMs: config.productCacheTtlMs,
+          }
+        : null,
+    };
+  }
+
+  return entry.result;
+}
+
+function createTaskCacheEntry(task) {
+  if (!task?.result?.productID) return null;
+
+  return {
+    itemId: String(task.result.productID),
+    result: task.result,
+    raw: task.raw,
+    affiliateUrl: task.affiliateUrl,
+    cachedAt: null,
+    cachedAtMs: Date.now(),
+  };
+}
+
+function buildTaskProductPayload(task, mode = "compact") {
+  const entry = createTaskCacheEntry(task);
+  return entry ? buildProductPayload(entry, mode) : task?.result || null;
+}
+
+function waitForTaskDone(taskId, timeoutMs) {
+  const startedAt = Date.now();
+
+  return new Promise((resolve) => {
+    const tick = () => {
+      const task = taskStore.getTask(taskId);
+      if (!task || isCompletedTask(task)) {
+        resolve(task);
+        return;
+      }
+
+      if (Date.now() - startedAt >= timeoutMs) {
+        resolve(task);
+        return;
+      }
+
+      setTimeout(tick, Math.min(config.taskPollMs, 100));
+    };
+
+    tick();
+  });
+}
+
+function readBooleanQuery(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
+function normalizeListQueryValue(value, fallback, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.min(Math.floor(parsed), max));
+}
+
+async function readProductStoreSize() {
+  try {
+    return await productStore.size();
+  } catch {
+    return null;
+  }
+}
+
+async function fetchProductByItemId(itemId, mode, options = {}) {
+  const startedAt = Date.now();
+  const refresh = Boolean(options.refresh);
+
+  if (!refresh) {
+    const cached = getCachedProduct(itemId);
+    if (cached) {
+      return {
+        statusCode: 200,
+        payload: {
+          type: "SUCCESS",
+          cacheHit: true,
+          storeHit: false,
+          source: "memory",
+          itemId,
+          mode,
+          result: buildProductPayload(cached, mode),
+          cachedAt: cached.cachedAt,
+          durationMs: Date.now() - startedAt,
+        },
+      };
+    }
+
+    const stored = await productStore.getProduct(itemId);
+    if (stored) {
+      const entry = buildStoreProductEntry(stored);
+      setCachedProduct(stored.result, stored.raw, stored.affiliateUrl);
+      return {
+        statusCode: 200,
+        payload: {
+          type: "SUCCESS",
+          cacheHit: false,
+          storeHit: true,
+          source: productStore.driver,
+          itemId,
+          mode,
+          result: buildProductPayload(entry, mode),
+          cachedAt: stored.updatedAt,
+          durationMs: Date.now() - startedAt,
+        },
+      };
+    }
+  }
+
+  const payload = {
+    taskId: crypto.randomUUID(),
+    itemId,
+    skipCache: refresh,
+  };
+  const queued = enqueueTaskForWorker(payload, null);
+  if (!queued.ok) {
+    return {
+      statusCode: queued.statusCode,
+      payload: queued.error,
+    };
+  }
+
+  const task = await waitForTaskDone(payload.taskId, config.productRequestTimeoutMs);
+  if (task?.status === TASK_STATUS.SUCCESS) {
+    return {
+      statusCode: 200,
+      payload: {
+        type: "SUCCESS",
+        cacheHit: Boolean(queued.fromCache),
+        storeHit: false,
+        source: queued.fromCache ? "memory" : "worker",
+        itemId,
+        mode,
+        result: buildTaskProductPayload(task, mode),
+        task: buildTaskResponse(task),
+        durationMs: Date.now() - startedAt,
+      },
+    };
+  }
+
+  if (task?.status === TASK_STATUS.ERROR) {
+    return {
+      statusCode: 502,
+      payload: {
+        type: "ERROR",
+        itemId,
+        error: task.error,
+        errorCode: task.errorCode,
+        task: buildTaskResponse(task),
+        durationMs: Date.now() - startedAt,
+      },
+    };
+  }
+
+  return {
+    statusCode: 202,
+    payload: {
+      type: "QUEUED",
+      message: "Task dang xu ly, lay ket qua bang /tasks/:taskId",
+      itemId,
+      task: task ? buildTaskResponse(task) : buildTaskResponse(queued.task),
+      durationMs: Date.now() - startedAt,
+    },
+  };
+}
+
 function sendJson(ws, payload) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(payload));
@@ -203,6 +494,7 @@ function sendTaskUpdate(taskId, patch) {
 
   if (patch.message) payload.message = patch.message;
   if (patch.error) payload.error = patch.error;
+  if (patch.errorCode) payload.errorCode = patch.errorCode;
   if (patch.affiliateUrl) payload.affiliateUrl = patch.affiliateUrl;
   if ("result" in patch) payload.result = patch.result;
   if (patch.parseError) payload.parseError = patch.parseError;
@@ -323,11 +615,33 @@ function buildErrorMessage(message, extra = {}) {
   };
 }
 
+function isCompletedTask(task) {
+  return task?.status === TASK_STATUS.SUCCESS || task?.status === TASK_STATUS.ERROR;
+}
+
 function updateTask(taskId, patch) {
   return taskStore.updateTask(taskId, patch);
 }
 
 function cleanupExpiredTasks() {
+  const timedOutTasks = taskStore.timeoutStuckTasks();
+  for (const task of timedOutTasks) {
+    logger.warn("task.timed_out", {
+      taskId: task.taskId,
+      requestUrl: task.requestUrl,
+      status: task.status,
+      message: task.error,
+    });
+    sendTaskUpdate(task.taskId, {
+      type: "ERROR",
+      status: TASK_STATUS.ERROR,
+      error: task.error,
+      errorCode: task.errorCode,
+      result: null,
+    });
+    clearRequesterSocket(task.taskId);
+  }
+
   const removed = taskStore.cleanupExpiredTasks();
   if (removed > 0) {
     logger.info("task.cleanup", {
@@ -363,6 +677,7 @@ function buildTaskResponse(task) {
     result: task.result,
     raw: task.raw,
     error: task.error,
+    errorCode: task.errorCode,
     parseError: task.parseError,
     startedAt: task.startedAt,
     endedAt: task.endedAt,
@@ -429,6 +744,45 @@ function enqueueTaskForWorker(payload, requester) {
     };
   }
 
+  const itemId = getRequestItemId(payload);
+  const cached = itemId && !payload.skipCache ? getCachedProduct(itemId) : null;
+  if (cached) {
+    const task = registerTask(payload, requester);
+    const completedTask = updateTask(task.taskId, {
+      status: TASK_STATUS.SUCCESS,
+      affiliateUrl: cached.affiliateUrl,
+      result: cached.result,
+      raw: cached.raw,
+      error: null,
+      errorCode: null,
+      parseError: null,
+    });
+
+    logger.info("task.cache_hit", {
+      taskId: task.taskId,
+      itemId,
+      requestUrl: task.requestUrl,
+      cachedAt: cached.cachedAt,
+    });
+
+    if (requester) {
+      sendTaskUpdate(task.taskId, {
+        type: "SUCCESS",
+        status: TASK_STATUS.SUCCESS,
+        affiliateUrl: cached.affiliateUrl,
+        result: cached.result,
+      });
+      clearRequesterSocket(task.taskId);
+    }
+
+    return {
+      ok: true,
+      task: completedTask,
+      workerClientId: null,
+      fromCache: true,
+    };
+  }
+
   const workers = getWorkerClients(wss);
   if (workers.length === 0) {
     return {
@@ -477,7 +831,156 @@ const httpServer = http.createServer(async (req, res) => {
       port: config.port,
       workerClients: getWorkerClients(wss).length,
       taskCount: taskStore.size(),
+      productStoreDriver: productStore.driver,
+      productCount: await readProductStoreSize(),
     });
+    return;
+  }
+
+  if (method === "GET" && requestUrl.pathname === "/session") {
+    sendHttpJson(res, 200, {
+      ok: true,
+      chromeCdpUrl: config.browserCdpUrl || null,
+      workerClients: getWorkerClients(wss).length,
+      taskCount: taskStore.size(),
+      cacheSize: productCache.size,
+      productCount: await readProductStoreSize(),
+      productStoreDriver: productStore.driver,
+      productCacheTtlMs: config.productCacheTtlMs,
+      session: latestWorkerSession,
+    });
+    return;
+  }
+
+  if (method === "GET" && requestUrl.pathname === "/products") {
+    const limit = normalizeListQueryValue(
+      requestUrl.searchParams.get("limit"),
+      50,
+      200,
+    );
+    const offset = normalizeListQueryValue(
+      requestUrl.searchParams.get("offset"),
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const q = requestUrl.searchParams.get("q") || "";
+    const mode = normalizeOutputMode(requestUrl.searchParams.get("mode"));
+    const payload = await productStore.listProducts({ limit, offset, q });
+
+    sendHttpJson(res, 200, {
+      total: payload.total,
+      limit: payload.limit,
+      offset: payload.offset,
+      mode,
+      source: productStore.driver,
+      products: payload.items.map((record) =>
+        buildProductPayload(buildStoreProductEntry(record), mode),
+      ),
+    });
+    return;
+  }
+
+  if (method === "GET" && requestUrl.pathname.startsWith("/products/") && requestUrl.pathname.endsWith("/history")) {
+    const itemId = decodeURIComponent(
+      requestUrl.pathname.slice("/products/".length, -"/history".length),
+    ).trim();
+
+    if (!isValidItemId(itemId)) {
+      sendHttpJson(res, 400, buildErrorMessage("itemId khong hop le", { itemId }));
+      return;
+    }
+
+    const limit = normalizeListQueryValue(
+      requestUrl.searchParams.get("limit"),
+      100,
+      1000,
+    );
+    const history = await productStore.getPriceHistory(itemId, { limit });
+
+    sendHttpJson(res, 200, {
+      itemId,
+      source: productStore.driver,
+      total: history.length,
+      history,
+    });
+    return;
+  }
+
+  if (method === "POST" && requestUrl.pathname === "/products/batch") {
+    try {
+      const body = await readJsonBody(req);
+      const mode = normalizeOutputMode(body.mode || requestUrl.searchParams.get("mode"));
+      const refresh = Boolean(body.refresh) || readBooleanQuery(requestUrl.searchParams.get("refresh"));
+      const rawItems = Array.isArray(body.itemIds)
+        ? body.itemIds
+        : Array.isArray(body.items)
+          ? body.items
+          : Array.isArray(body.urls)
+            ? body.urls
+            : [];
+      const itemIds = Array.from(
+        new Set(rawItems.map(extractItemIdFromInput).filter(isValidItemId)),
+      );
+      const invalidItems = rawItems
+        .map((item) => String(item || "").trim())
+        .filter((item) => item && !isValidItemId(extractItemIdFromInput(item)));
+
+      if (itemIds.length === 0) {
+        sendHttpJson(res, 400, buildErrorMessage("Thieu itemIds/items/urls hop le"));
+        return;
+      }
+
+      if (itemIds.length > config.productBatchLimit) {
+        sendHttpJson(res, 400, buildErrorMessage(
+          `Batch toi da ${config.productBatchLimit} san pham moi request`,
+          { limit: config.productBatchLimit },
+        ));
+        return;
+      }
+
+      const results = await Promise.all(
+        itemIds.map(async (itemId) => {
+          const result = await fetchProductByItemId(itemId, mode, { refresh });
+          return {
+            itemId,
+            statusCode: result.statusCode,
+            ...result.payload,
+          };
+        }),
+      );
+
+      sendHttpJson(res, 200, {
+        type: "BATCH",
+        mode,
+        refresh,
+        total: results.length,
+        invalidItems,
+        results,
+      });
+    } catch (error) {
+      logger.warn("http.invalid_request", {
+        method,
+        path: requestUrl.pathname,
+        message: error.message,
+      });
+      sendHttpJson(res, 400, buildErrorMessage(error.message));
+    }
+
+    return;
+  }
+
+  if (method === "GET" && requestUrl.pathname.startsWith("/product/")) {
+    const itemId = decodeURIComponent(requestUrl.pathname.slice("/product/".length)).trim();
+    const mode = normalizeOutputMode(requestUrl.searchParams.get("mode"));
+    const refresh = readBooleanQuery(requestUrl.searchParams.get("refresh"));
+
+    if (!isValidItemId(itemId)) {
+      sendHttpJson(res, 400, buildErrorMessage("itemId khong hop le", { itemId }));
+      return;
+    }
+
+    const result = await fetchProductByItemId(itemId, mode, { refresh });
+    sendHttpJson(res, result.statusCode, result.payload);
     return;
   }
 
@@ -490,9 +993,7 @@ const httpServer = http.createServer(async (req, res) => {
         itemId:
           typeof body.itemId === "string" && body.itemId.trim()
             ? body.itemId.trim()
-            : typeof body.item_id === "string" && body.item_id.trim()
-              ? body.item_id.trim()
-              : "",
+            : "",
       };
 
       const result = enqueueTaskForWorker(payload, null);
@@ -507,9 +1008,12 @@ const httpServer = http.createServer(async (req, res) => {
         return;
       }
 
-      sendHttpJson(res, 202, {
-        type: "QUEUED",
-        message: `Task da duoc dua sang worker #${result.workerClientId}`,
+      sendHttpJson(res, result.fromCache ? 200 : 202, {
+        type: result.fromCache ? "SUCCESS" : "QUEUED",
+        message: result.fromCache
+          ? "Task tra ve tu cache"
+          : `Task da duoc dua sang worker #${result.workerClientId}`,
+        cacheHit: Boolean(result.fromCache),
         task: buildTaskResponse(result.task),
       });
     } catch (error) {
@@ -546,6 +1050,65 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     sendHttpJson(res, 200, { task: buildTaskResponse(task) });
+    return;
+  }
+
+  if (method === "POST" && requestUrl.pathname.startsWith("/tasks/") && requestUrl.pathname.endsWith("/cancel")) {
+    const taskId = decodeURIComponent(
+      requestUrl.pathname.slice("/tasks/".length, -"/cancel".length)
+    );
+    const existingTask = taskStore.getTask(taskId);
+
+    if (!existingTask) {
+      sendHttpJson(res, 404, buildErrorMessage("Khong tim thay task", { taskId }));
+      return;
+    }
+
+    if (isCompletedTask(existingTask)) {
+      sendHttpJson(res, 409, buildErrorMessage("Task da ket thuc, khong can cancel", {
+        taskId,
+        task: buildTaskResponse(existingTask),
+      }));
+      return;
+    }
+
+    const task = updateTask(taskId, {
+      status: TASK_STATUS.ERROR,
+      errorCode: "TASK_CANCELLED",
+      error: "Task da bi huy",
+    });
+
+    logger.warn("task.cancelled", {
+      taskId,
+      requestUrl: task.requestUrl,
+    });
+    sendTaskUpdate(taskId, {
+      type: "ERROR",
+      status: TASK_STATUS.ERROR,
+      errorCode: "TASK_CANCELLED",
+      error: "Task da bi huy",
+      result: null,
+    });
+    clearRequesterSocket(taskId);
+
+    sendHttpJson(res, 200, { task: buildTaskResponse(task) });
+    return;
+  }
+
+  if (method === "DELETE" && requestUrl.pathname.startsWith("/tasks/")) {
+    const taskId = decodeURIComponent(requestUrl.pathname.slice("/tasks/".length));
+    const task = taskStore.removeTask(taskId);
+    clearRequesterSocket(taskId);
+
+    if (!task) {
+      sendHttpJson(res, 404, buildErrorMessage("Khong tim thay task", { taskId }));
+      return;
+    }
+
+    sendHttpJson(res, 200, {
+      removed: true,
+      task: buildTaskResponse(task),
+    });
     return;
   }
 
@@ -588,7 +1151,7 @@ wss.on("connection", (ws) => {
           clientId: ws.meta?.clientId,
           preview: String(message.rawText || "").slice(0, 100),
         });
-        sendJson(ws, buildErrorMessage("Message khong hop le. Hay gui JSON, paste link Shopee, item_id, hoac dung: scrape <link|item_id>"));
+        sendJson(ws, buildErrorMessage("Message khong hop le. Hay gui JSON, paste link Shopee, itemId, hoac dung: scrape <link|itemId>"));
         return;
       }
 
@@ -606,13 +1169,15 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      sendJson(ws, {
-        type: "ACCEPTED",
-        taskId: result.task.taskId,
-        requestUrl: result.task.requestUrl,
-        status: result.task.status,
-        message: "Da nhan lenh tu raw link/command",
-      });
+      if (!result.fromCache) {
+        sendJson(ws, {
+          type: "ACCEPTED",
+          taskId: result.task.taskId,
+          requestUrl: result.task.requestUrl,
+          status: result.task.status,
+          message: "Da nhan lenh tu raw link/command",
+        });
+      }
       return;
     }
 
@@ -627,12 +1192,21 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (payload.type === "SESSION_STATUS") {
+      const { type, ...sessionPatch } = payload;
+      latestWorkerSession = {
+        ...latestWorkerSession,
+        ...sessionPatch,
+        updatedAt: new Date().toISOString(),
+      };
+      logger.info("worker.session_status", latestWorkerSession);
+      return;
+    }
+
     const normalizedItemId =
       typeof payload.itemId === "string" && payload.itemId.trim()
         ? payload.itemId.trim()
-        : typeof payload.item_id === "string" && payload.item_id.trim()
-          ? payload.item_id.trim()
-          : "";
+        : "";
 
     if ((payload.url || normalizedItemId) && !payload.data) {
       payload.itemId = normalizedItemId;
@@ -687,15 +1261,28 @@ wss.on("connection", (ws) => {
         logger.warn("task.orphan_success", { taskId: payload.taskId });
         return;
       }
+      if (isCompletedTask(existingTask)) {
+        logger.warn("task.late_result_ignored", {
+          taskId: payload.taskId,
+          currentStatus: existingTask.status,
+          workerResultType: payload.type,
+        });
+        return;
+      }
 
       try {
+        const parseStartedAt = Date.now();
         const product = normalizeShopeeProduct(payload.data);
+        const parseMs = Date.now() - parseStartedAt;
+        setCachedProduct(product, payload.data, payload.url);
+        void persistProduct(product, payload.data, payload.url, "worker");
         const task = updateTask(payload.taskId, {
           status: TASK_STATUS.SUCCESS,
           affiliateUrl: payload.url,
           result: product,
           raw: payload.data,
           error: null,
+          errorCode: null,
           parseError: null,
         });
 
@@ -707,6 +1294,7 @@ wss.on("connection", (ws) => {
           shopName: product.shopName,
           price: product.price,
           commission: product.commission,
+          parseMs,
         });
 
         sendTaskUpdate(payload.taskId, {
@@ -746,10 +1334,21 @@ wss.on("connection", (ws) => {
     }
 
     if (payload.type === "ERROR") {
+      const existingTask = taskStore.getTask(payload.taskId);
+      if (isCompletedTask(existingTask)) {
+        logger.warn("task.late_result_ignored", {
+          taskId: payload.taskId,
+          currentStatus: existingTask.status,
+          workerResultType: payload.type,
+        });
+        return;
+      }
+
       const task = updateTask(payload.taskId, {
         status: TASK_STATUS.ERROR,
         affiliateUrl: payload.url || null,
         error: payload.message || "Worker tra ve loi khong ro nguyen nhan",
+        errorCode: payload.code || "WORKER_ERROR",
       });
 
       logger.warn("task.failed", {
@@ -757,6 +1356,7 @@ wss.on("connection", (ws) => {
         requestUrl: task?.requestUrl || null,
         affiliateUrl: payload.url || null,
         message: payload.message,
+        errorCode: payload.code || "WORKER_ERROR",
       });
 
       if (task) {
@@ -765,6 +1365,7 @@ wss.on("connection", (ws) => {
           status: TASK_STATUS.ERROR,
           affiliateUrl: payload.url,
           error: payload.message || "Worker tra ve loi khong ro nguyen nhan",
+          errorCode: payload.code || "WORKER_ERROR",
           result: null,
         });
         clearRequesterSocket(payload.taskId);
@@ -784,4 +1385,19 @@ httpServer.on("error", (err) => {
   logger.error("server.error", { message: err.message });
 });
 
-httpServer.listen(config.port);
+async function startServer() {
+  await productStore.init();
+  logger.info("product_store.ready", {
+    driver: productStore.driver,
+    productCount: await readProductStoreSize(),
+  });
+  httpServer.listen(config.port);
+}
+
+startServer().catch((error) => {
+  logger.error("product_store.init_failed", {
+    driver: productStore.driver,
+    message: error.message,
+  });
+  process.exitCode = 1;
+});
