@@ -252,7 +252,7 @@ async function handleInput(line) {
   }
 
   if (input === "help") {
-    console.log("Paste link Shopee hoac item_id de crawl.");
+    console.log("Paste link Shopee hoac itemId de crawl.");
     console.log("Commands:");
     console.log("- health");
     console.log("- tasks [status]");
@@ -303,7 +303,7 @@ async function handleInput(line) {
   if (!input.startsWith("http://") && !input.startsWith("https://")) {
     if (!/^\d+$/.test(input)) {
       console.log(
-        "Chi can paste link Shopee day du hoac item_id, vi du: https://shopee.vn/product/344837665/57458114650 hoac 57458114650",
+        "Chi can paste link Shopee day du hoac itemId, vi du: https://shopee.vn/product/344837665/57458114650 hoac 57458114650",
       );
       console.log("Go 'help' de xem cac lenh ho tro.");
       return;
@@ -332,7 +332,7 @@ async function handleInput(line) {
 async function startCli() {
   console.log(`Shopee CLI dang noi toi http://127.0.0.1:${config.port}`);
   console.log(
-    "Paste link Shopee hoac item_id vao dau > . Go 'help' de xem lenh, 'exit' de thoat.",
+    "Paste link Shopee hoac itemId vao dau > . Go 'help' de xem lenh, 'exit' de thoat.",
   );
 
   try {

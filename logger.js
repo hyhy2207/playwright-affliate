@@ -28,6 +28,12 @@ function formatConsoleLine(entry) {
       return `${prefix} Server dang chay tai :${entry.port}`;
     case "server.error":
       return `${prefix} Server error: ${entry.message}`;
+    case "product_store.ready":
+      return `${prefix} Product store san sang (${entry.driver}) | products=${entry.productCount ?? "-"}`;
+    case "product_store.init_failed":
+      return `${prefix} Product store loi (${entry.driver}): ${entry.message}`;
+    case "product_store.upsert_failed":
+      return `${prefix} Luu product ${entry.itemId || "-"} vao store loi: ${entry.message}`;
     case "socket.connected":
       return `${prefix} Client #${entry.clientId} ket noi (${entry.role})`;
     case "socket.closed":
@@ -40,12 +46,20 @@ function formatConsoleLine(entry) {
       return `${prefix} Task ${entry.taskId} duoc tao cho ${shorten(entry.requestUrl)}`;
     case "task.queued":
       return `${prefix} Task ${entry.taskId} queued -> worker #${entry.workerClientId}`;
+    case "task.cache_hit":
+      return `${prefix} Task ${entry.taskId} tra ve tu cache item ${entry.itemId}`;
     case "task.started":
       return `${prefix} Task ${entry.taskId} dang chay`;
     case "task.succeeded":
-      return `${prefix} Task ${entry.taskId} thanh cong | ${entry.productName} | ${entry.price}`;
+      return `${prefix} Task ${entry.taskId} thanh cong | ${entry.productName} | ${entry.price} | parse ${entry.parseMs ?? "-"}ms`;
     case "task.failed":
-      return `${prefix} Task ${entry.taskId} that bai: ${entry.message}`;
+      return `${prefix} Task ${entry.taskId} that bai${entry.errorCode ? ` (${entry.errorCode})` : ""}: ${entry.message}`;
+    case "task.cancelled":
+      return `${prefix} Task ${entry.taskId} da huy`;
+    case "task.timed_out":
+      return `${prefix} Task ${entry.taskId} timeout: ${entry.message}`;
+    case "task.late_result_ignored":
+      return `${prefix} Bo qua ket qua muon cua task ${entry.taskId} (${entry.currentStatus})`;
     case "task.success_parse_failed":
       return `${prefix} Task ${entry.taskId} thanh cong nhung parse loi: ${entry.message}`;
     case "task.requester_disconnected":
@@ -73,6 +87,14 @@ function formatConsoleLine(entry) {
       return `${prefix} Profile Playwright san sang | ${shorten(entry.currentUrl)}`;
     case "worker.login_required":
       return `${prefix} Profile Playwright chua login affiliate: ${entry.message}`;
+    case "worker.session_status":
+      return `${prefix} Session worker | ready=${entry.workerReady} | login=${entry.affiliateLoggedIn} | ${shorten(entry.currentUrl || entry.message || "")}`;
+    case "worker.fast_api_hit":
+      return `${prefix} Fast API hit task ${entry.taskId} | ${entry.apiFetchMs}ms`;
+    case "worker.fast_api_fallback":
+      return `${prefix} Fast API fallback task ${entry.taskId} | ${entry.apiFetchMs}ms | ${entry.reason}`;
+    case "worker.fallback_goto":
+      return `${prefix} Fallback goto task ${entry.taskId} | ${entry.gotoMs}ms`;
     case "task.orphan_success":
       return `${prefix} Nhan SUCCESS cho task khong ton tai: ${entry.taskId}`;
     case "logger.file_logging_disabled":
@@ -92,6 +114,20 @@ function ensureLogDirectory() {
   fs.mkdirSync(logDirectory, { recursive: true });
 }
 
+function rotateTaskLogIfNeeded() {
+  if (!config.logMaxBytes) return;
+  if (!fs.existsSync(taskLogPath)) return;
+
+  const stat = fs.statSync(taskLogPath);
+  if (stat.size < config.logMaxBytes) return;
+
+  const rotatedPath = `${taskLogPath}.1`;
+  if (fs.existsSync(rotatedPath)) {
+    fs.unlinkSync(rotatedPath);
+  }
+  fs.renameSync(taskLogPath, rotatedPath);
+}
+
 function createEntry(level, event, data) {
   return {
     timestamp: new Date().toISOString(),
@@ -104,6 +140,7 @@ function createEntry(level, event, data) {
 function writeTaskLog(entry) {
   try {
     ensureLogDirectory();
+    rotateTaskLogIfNeeded();
     fs.appendFileSync(taskLogPath, `${JSON.stringify(entry)}\n`, "utf8");
   } catch (error) {
     if (!hasWarnedAboutFileLogging) {
