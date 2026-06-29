@@ -92,7 +92,14 @@ function createTaskStore() {
       taskId,
       requestUrl,
       requesterClientId,
+      assignedWorkerClientId: null,
+      queueTracked: false,
       status,
+      itemId: null,
+      requestPayload: null,
+      retryCount: 0,
+      maxRetries: config.taskMaxRetries,
+      nextAttemptAt: null,
       affiliateUrl: null,
       result: null,
       raw: null,
@@ -107,6 +114,40 @@ function createTaskStore() {
 
     tasks.set(taskId, task);
     return task;
+  }
+
+  function hydrateTask(snapshot) {
+    if (!snapshot?.taskId) return null;
+
+    cleanupExpiredTasks();
+
+    const timestamp = nowIso();
+    const baseTask = {
+      taskId: snapshot.taskId,
+      requestUrl: snapshot.requestUrl || snapshot.itemId || "",
+      requesterClientId: snapshot.requesterClientId ?? null,
+      assignedWorkerClientId: snapshot.assignedWorkerClientId ?? null,
+      queueTracked: Boolean(snapshot.queueTracked),
+      status: snapshot.status || TASK_STATUS.QUEUED,
+      itemId: snapshot.itemId || null,
+      requestPayload: snapshot.requestPayload || null,
+      retryCount: Number(snapshot.retryCount || 0),
+      maxRetries: Number(snapshot.maxRetries || config.taskMaxRetries),
+      nextAttemptAt: snapshot.nextAttemptAt || null,
+      affiliateUrl: snapshot.affiliateUrl || null,
+      result: snapshot.result ?? null,
+      raw: snapshot.raw ?? null,
+      error: snapshot.error || null,
+      errorCode: snapshot.errorCode || null,
+      parseError: snapshot.parseError || null,
+      startedAt: snapshot.startedAt || null,
+      endedAt: snapshot.endedAt || null,
+      createdAt: snapshot.createdAt || timestamp,
+      updatedAt: snapshot.updatedAt || timestamp,
+    };
+
+    tasks.set(baseTask.taskId, baseTask);
+    return baseTask;
   }
 
   function getTask(taskId) {
@@ -170,6 +211,7 @@ function createTaskStore() {
   return {
     TASK_STATUS,
     createTask,
+    hydrateTask,
     getTask,
     hasTask,
     updateTask,

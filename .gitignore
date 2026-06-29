@@ -1,6 +1,6 @@
 logs/
 data/
-.browser-profile/
+.profiles/
 node_modules/
 .env
 .env.example

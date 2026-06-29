@@ -14,6 +14,11 @@ Ban nay la huong di song song voi `extension-shopee`, nhung thay worker Chrome E
 - `server.js`: HTTP + WebSocket relay
 - `playwright-worker.js`: worker nhan task va mo Playwright
 - `worker-login.js`: mo profile de login thu cong
+- `profile-launcher.js`: cho chon profile truoc khi chay `login` / `stack` / `api` / `worker`
+- `profile-manager.js`: luu danh sach profile va profile mac dinh
+- `providers/shopee/`: gom logic dac thu Shopee de sau nay tach them provider khac de hon
+- `http-utils.js`: helper cho HTTP response/request body
+- `task-presenter.js`: chuan hoa task response cho API/CLI
 - `cli.js`: prompt `>` de paste link Shopee
 
 Tai lieu source chi tiet:
@@ -59,6 +64,9 @@ LOG_MAX_BYTES=10485760
 TASK_RETENTION_MS=1800000
 TASK_QUEUE_TIMEOUT_MS=10000
 TASK_TIMEOUT_MS=15000
+TASK_MAX_RETRIES=2
+TASK_RETRY_DELAY_MS=1500
+TASK_HISTORY_PER_ITEM_LIMIT=3
 PRODUCT_CACHE_TTL_MS=300000
 PRODUCT_REQUEST_TIMEOUT_MS=10000
 PRODUCT_BATCH_LIMIT=20
@@ -74,10 +82,24 @@ SERVICE_AUTO_RESTART=true
 SERVICE_RESTART_DELAY_MS=2000
 TASK_POLL_MS=200
 WORKER_SOCKET_URL=ws://127.0.0.1:8080
-BROWSER_PROFILE_DIR=.browser-profile
+QUEUE_DRIVER=memory
+QUEUE_DRIVER_FALLBACK=memory
+QUEUE_NAME=shopee-task-queue
+QUEUE_PREFIX=playwright-shopee
+QUEUE_DISPATCH_CONCURRENCY=1
+REDIS_URL=redis://127.0.0.1:6379/0
+BROWSER_PROFILE_DIR=.profiles/default
 BROWSER_CDP_URL=http://127.0.0.1:9222
 BROWSER_CHANNEL=chrome
 BROWSER_EXECUTABLE_PATH=
+PROFILE_COOLDOWN_MS=1200000
+PROFILE_COOLDOWN_MAX_MS=21600000
+PROFILE_MIN_TASK_GAP_MS=1200
+PROFILE_SWITCH_DEBOUNCE_MS=5000
+PROFILE_WARMUP_ENABLED=true
+PROFILE_WARMUP_DELAY_MS=4000
+PROFILE_WARMUP_DEEP_ENABLED=true
+PROFILE_WARMUP_KEYWORDS=ao,quan,giay
 HEADLESS=false
 SCRAPE_TIMEOUT_MS=8000
 PAGE_SETTLE_MS=120
@@ -100,13 +122,150 @@ BROWSER_EXECUTABLE_PATH=/path/to/chrome
 Neu Shopee thuong chuyen sang `verify/traffic` hoac `verify/captcha`, uu tien attach vao Chrome that qua CDP:
 
 ```bash
-google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/shopee-cdp-profile
+google-chrome --remote-debugging-port=<PORT_CUA_PROFILE> --user-data-dir=<THU_MUC_PROFILE>
 ```
 
 Sau do set:
 
 ```bash
-BROWSER_CDP_URL=http://127.0.0.1:9222
+BROWSER_CDP_URL=http://127.0.0.1:<PORT_CUA_PROFILE>
+```
+
+Vi du voi profile `thanhhuy2` dang dung port `9223`:
+
+```bash
+google-chrome --remote-debugging-port=9223 --user-data-dir=.profiles/thanhhuy2
+```
+
+## Quan ly nhieu profile
+
+He thong hien tai se luu profile da dang nhap theo tung thu muc rieng trong `.profiles/`.
+
+- Profile cu `.browser-profile` neu co se duoc migrate sang `.profiles/default` o lan chay dau tien.
+- Moi profile moi se co `BROWSER_PROFILE_DIR` rieng.
+- Neu dang dung `BROWSER_CDP_URL`, moi profile moi se duoc cap 1 CDP port rieng, bat dau tu port trong `.env` (vi du `9222`, `9223`, `9224`...).
+- Khi profile bi Shopee chan trong luc crawl, he thong se dua profile do vao cooldown trong `PROFILE_COOLDOWN_MS` va thu doi sang profile khac con san sang.
+
+## On dinh va tu phuc hoi
+
+He thong hien tai co them cac co che:
+
+- `task-queue.js` la queue factory, co the chay bang `memory` hoac `bullmq`.
+- `task-queue-memory.js` giu co che queue trong process nhu hien tai.
+- `task-queue-bullmq.js` cho phep dua queue len Redis/BullMQ ma khong doi API ben ngoai.
+- Khi dung `bullmq`, Redis se giu pending/delayed jobs that su; khong can `tasks-pending.json` de khoi phuc job nua.
+- PostgreSQL luu `task_history` de giu lich su task va phuc hoi metadata task active khi server restart.
+- `task_history` se tu dong prune bot cac ban ghi `success/error` cu theo tung `itemId`; mac dinh giu lai `TASK_HISTORY_PER_ITEM_LIMIT=3` ban ghi moi nhat moi san pham de tranh phinh bang khi cung mot SP bi goi bang URL va `itemId`.
+- Retry task tu dong cho loi tam thoi nhu `WORKER_ERROR`, `CDP_DISCONNECTED`.
+- Giam toc theo profile bang `PROFILE_MIN_TASK_GAP_MS` de tranh ban request qua sat.
+- Auto-switch profile khi dang crawl ma Shopee tra `captcha/loading issue/block`.
+- Warm-up sau hon cho profile moi qua `shopee.vn`, `mall`, `search` truoc khi vao Affiliate neu `PROFILE_WARMUP_DEEP_ENABLED=true`.
+- Co the doi keyword warm-up qua `PROFILE_WARMUP_KEYWORDS` trong `.env`, vi du `ao,quan,giay,the thao`.
+- Neu worker mat ket noi luc dang xu ly, cac task chua xong se duoc dua lai vao queue de cho worker ket noi lai.
+
+Neu muon bat dau chuyen sang BullMQ:
+
+```bash
+QUEUE_DRIVER=bullmq
+REDIS_URL=redis://127.0.0.1:6379/0
+QUEUE_NAME=shopee-task-queue
+QUEUE_PREFIX=playwright-shopee
+QUEUE_DISPATCH_CONCURRENCY=1
+```
+
+Luu y:
+
+- `memory` van la mode mac dinh de an toan.
+- `bullmq` can `bullmq` + `ioredis` trong `package.json` va Redis dang chay.
+- Neu `QUEUE_DRIVER=bullmq` nhung Redis/chuoi ket noi chua san sang, he thong co the roi ve `QUEUE_DRIVER_FALLBACK=memory`.
+- PostgreSQL van dung de luu product/history/task data, khong thay the vai tro cua Redis queue.
+
+Luu y:
+
+- `SESSION_STATUS` chi duoc phat khi task dang crawl ma bi Shopee chan.
+- Auto-switch se bo qua profile dang cooldown hoac bi disable.
+- Task crawl co the thay `retryCount`, `maxRetries`, `nextAttemptAt` trong API `/tasks/:taskId`.
+
+Co 3 cach chon profile:
+
+```bash
+npm run profiles
+npm run login
+npm run stack
+```
+
+Co the xoa profile bang menu:
+
+```bash
+npm run profiles
+```
+
+Hoac xoa thang theo ten:
+
+```bash
+npm run profiles -- --delete-profile=seller-a
+```
+
+Quan ly profile bang HTTP API:
+
+```bash
+curl http://127.0.0.1:8080/profiles
+curl -X POST http://127.0.0.1:8080/profiles/thanhhuy/recover
+curl -X POST http://127.0.0.1:8080/profiles/thanhhuy/default
+curl -X POST http://127.0.0.1:8080/profiles/thanhhuy/disable
+curl -X POST http://127.0.0.1:8080/profiles/thanhhuy/enable
+curl -X POST http://127.0.0.1:8080/profiles/thanhhuy/cooldown -H "Content-Type: application/json" -d '{"durationMs":600000}'
+```
+
+HTTP API da duoc chuan hoa response de frontend de dung hon:
+
+- Thanh cong: luon co `ok: true`, `data`, va co the co them `meta`.
+- Loi: luon co `ok: false`, `error.code`, `error.message`, `error.details`.
+- De giu tuong thich nguoc, cac field cu nhu `task`, `tasks`, `profiles`, `type`, `message` van duoc giu o top-level.
+
+Vi du:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "task": {
+      "taskId": "abc",
+      "status": "queued"
+    }
+  },
+  "task": {
+    "taskId": "abc",
+    "status": "queued"
+  },
+  "meta": {
+    "endpoint": "/scrape"
+  }
+}
+```
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "ERROR",
+    "message": "Khong tim thay task",
+    "details": {
+      "taskId": "abc"
+    }
+  },
+  "message": "Khong tim thay task",
+  "errorCode": "ERROR",
+  "taskId": "abc"
+}
+```
+
+Hoac chon thang theo ten:
+
+```bash
+npm run login -- --profile=seller-a
+npm run stack -- --profile=seller-a
+npm run api -- --profile=seller-a
 ```
 
 ---
@@ -115,17 +274,40 @@ BROWSER_CDP_URL=http://127.0.0.1:9222
 
 Nen dung Chrome that qua CDP de giam loi captcha/loading issue.
 
-## 1. Mo Chrome CDP
+## 1. Chon profile
+
+Neu muon tao hoac doi profile truoc khi login:
+
+```bash
+npm run profiles
+```
+
+Hoac chay thang lenh login/stack, script se hoi profile truoc khi mo.
+
+## Lưu ý quan trọng tránh bị khóa acc (quan trọng quan trọng cực quan trọng):
+
+- Sau khi tạo profile mới, ấn `Ctrl C` sau đó chạy bước 2, nên đăng nhập shopee trước -> xử lý capcha thành công -> đăng nhập affiliate -> xử lý tiếp capcha nếu có -> Thành công ấn `Ctrl C` -> `npm run stack`
+
+## 2. Mo Chrome CDP
 
 Mo terminal rieng va chay:
 
 ```bash
-google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/shopee-cdp-profile
+google-chrome --remote-debugging-port=<PORT_CUA_PROFILE> --user-data-dir=<THU_MUC_PROFILE>
 ```
 
-Giu terminal nay dang chay. Chrome mo ra tu lenh nay se dung profile rieng tai:
+Vi du neu profile dang chon la `thanhhuy2` va duoc gan port `9223`:
 
-## 2. Dang nhap profile Chrome
+```bash
+google-chrome --remote-debugging-port=9223 --user-data-dir=.profiles/thanhhuy2
+```
+
+Giu terminal nay dang chay. Chrome mo ra tu lenh nay se dung profile rieng tai thu muc da chon.
+
+Neu ban chay `npm run login` hoac `npm run stack` sau khi chon profile, tool cung co the tu thu mo Chrome CDP voi dung port/profile cua profile do.
+Neu profile moi thuong bi captcha, nen login bang tay va de warm-up chay xong truoc khi crawl.
+
+## 3. Dang nhap profile Chrome
 
 Trong cua so Chrome vua mo:
 
@@ -133,7 +315,7 @@ Trong cua so Chrome vua mo:
 - Khong dung Chrome profile dang mo san o cua so khac.
 - Sau khi dang nhap xong, giu nguyen cua so Chrome nay.
 
-## 3. Dang nhap Shopee truoc
+## 4. Dang nhap Shopee truoc
 
 Trong cung cua so Chrome do, mo:
 
@@ -149,7 +331,7 @@ Sau do:
 
 Buoc nay rat quan trong vi Shopee hay chan neu vao Affiliate ngay khi session Shopee chua on dinh.
 
-## 4. Dang nhap Shopee Affiliate
+## 5. Dang nhap Shopee Affiliate
 
 Sau khi Shopee da on dinh, mo tiep:
 
@@ -163,7 +345,7 @@ Sau do:
 - Xu ly captcha neu co.
 - Cho dashboard dung yen vai phut, khong bi da lai ve login/captcha/loading issue thi nhan `Ctrl+C`.
 
-## 5. Kiem tra Playwright attach vao Chrome
+## 6. Kiem tra Playwright attach vao Chrome
 
 Trong file `.env`, can co:
 
@@ -171,10 +353,41 @@ Trong file `.env`, can co:
 BROWSER_CDP_URL=http://127.0.0.1:9222
 ```
 
+Gia tri trong `.env` la port goc. Profile dau tien thuong dung `9222`, profile tiep theo co the la `9223`, `9224`... Script se tu doi sang port cua profile dang chon khi chay qua `npm run login`, `npm run stack`, `npm run api`.
+
+## Xoa profile
+
+Xoa bang menu:
+
+```bash
+npm run profiles
+```
+
+Trong menu, nhan `D` de chon profile can xoa.
+
+Xoa thang bang command:
+
+```bash
+npm run profiles -- --delete-profile=thanhhuy2
+```
+
+Luu y:
+
+- Lenh xoa se xoa ca thu muc du lieu cua profile trong `.profiles/`.
+- Khong the xoa profile cuoi cung.
+- Neu xoa profile mac dinh, he thong se tu chon profile con lai dau tien lam mac dinh moi.
+- He thong moi se luu profile tap trung trong `.profiles/`.
+
 Sau khi Chrome da login Shopee va Affiliate xong, co the chay:
 
 ```bash
 npm run login
+```
+
+Neu muon login vao profile cu the:
+
+```bash
+npm run login -- --profile=seller-a
 ```
 
 Lenh nay chi dung de kiem tra profile da san sang. Neu da vao duoc dashboard Affiliate thi nhan `Ctrl+C`.
@@ -187,6 +400,12 @@ Neu dung CDP thi session se nam trong profile Chrome:
 
 ```bash
 npm run stack
+```
+
+Neu muon crawl bang profile cu the:
+
+```bash
+npm run stack -- --profile=seller-a
 ```
 
 Lenh nay se tu dong:
@@ -212,6 +431,12 @@ Neu muon chay API nen, khong mo CLI:
 
 ```bash
 npm run api
+```
+
+Neu muon chay API voi profile cu the:
+
+```bash
+npm run api -- --profile=seller-a
 ```
 
 Lenh nay se:
@@ -306,6 +531,12 @@ Kiem tra session worker/CDP/cache:
 
 ```bash
 curl http://localhost:8080/session
+```
+
+Kiem tra queue driver va task dang cho:
+
+```bash
+curl http://localhost:8080/queue
 ```
 
 Huy task dang queued/running:

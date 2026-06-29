@@ -48,11 +48,60 @@ function toRecord(row) {
   };
 }
 
+function toTaskRecord(row) {
+  if (!row) return null;
+
+  return {
+    taskId: row.task_id,
+    itemId: row.item_id,
+    requestUrl: row.request_url,
+    requesterClientId: row.requester_client_id,
+    assignedWorkerClientId: row.assigned_worker_client_id,
+    status: row.status,
+    requestPayload: row.request_payload,
+    retryCount: Number(row.retry_count || 0),
+    maxRetries: Number(row.max_retries || 0),
+    nextAttemptAt: row.next_attempt_at instanceof Date ? row.next_attempt_at.toISOString() : row.next_attempt_at,
+    affiliateUrl: row.affiliate_url,
+    result: row.result,
+    raw: row.raw_json,
+    error: row.error_message,
+    errorCode: row.error_code,
+    parseError: row.parse_error,
+    startedAt: row.started_at instanceof Date ? row.started_at.toISOString() : row.started_at,
+    endedAt: row.ended_at instanceof Date ? row.ended_at.toISOString() : row.ended_at,
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
+  };
+}
+
+function normalizeTaskHistoryLimit(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.floor(parsed));
+}
+
+function shouldPruneTaskHistoryRecord(task, perItemLimit) {
+  const normalizedLimit = normalizeTaskHistoryLimit(perItemLimit);
+  if (normalizedLimit <= 0) return false;
+  if (!task?.itemId) return false;
+
+  return task.status === "success" || task.status === "error";
+}
+
+function isUndefinedTableError(error, relationName) {
+  return error?.code === "42P01" && String(error?.message || "").includes(`"${relationName}"`);
+}
+
 function createFileStore() {
   const dataDir = path.resolve(__dirname, config.productDataDir);
   const productFile = path.join(dataDir, config.productStoreFile);
   const historyFile = path.join(dataDir, config.productHistoryFile);
+  const taskFile = path.join(dataDir, "task-history.json");
   const products = new Map();
+  const tasks = new Map();
+  let persistTimer = null;
+  let isDirty = false;
 
   function load() {
     const raw = safeReadJson(productFile, { products: [] });
@@ -62,6 +111,14 @@ function createFileStore() {
     for (const item of items) {
       if (!item?.itemId || !item?.result) continue;
       products.set(String(item.itemId), item);
+    }
+
+    const rawTasks = safeReadJson(taskFile, { tasks: [] });
+    const taskItems = Array.isArray(rawTasks.tasks) ? rawTasks.tasks : [];
+    tasks.clear();
+    for (const task of taskItems) {
+      if (!task?.taskId) continue;
+      tasks.set(String(task.taskId), task);
     }
   }
 
@@ -75,6 +132,47 @@ function createFileStore() {
       ),
     };
     fs.writeFileSync(productFile, JSON.stringify(payload, null, 2), "utf8");
+
+    ensureDirectory(taskFile);
+    fs.writeFileSync(
+      taskFile,
+      JSON.stringify({
+        version: 1,
+        updatedAt: nowIso(),
+        tasks: Array.from(tasks.values()).sort((a, b) =>
+          String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")),
+        ),
+      }, null, 2),
+      "utf8",
+    );
+    isDirty = false;
+  }
+
+  function flushPersistTimer() {
+    if (!persistTimer) return;
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+
+  function schedulePersist() {
+    isDirty = true;
+    if (persistTimer) return;
+
+    persistTimer = setTimeout(() => {
+      persistTimer = null;
+      if (!isDirty) return;
+      persist();
+    }, config.productStoreFlushMs);
+
+    if (typeof persistTimer.unref === "function") {
+      persistTimer.unref();
+    }
+  }
+
+  function persistNow() {
+    flushPersistTimer();
+    if (!isDirty) return;
+    persist();
   }
 
   function appendHistory(record) {
@@ -147,7 +245,7 @@ function createFileStore() {
       };
 
       products.set(itemId, record);
-      persist();
+      schedulePersist();
       appendHistory({
         itemId,
         price: product.price,
@@ -168,11 +266,36 @@ function createFileStore() {
     async size() {
       return products.size;
     },
+    async upsertTaskRecord(task) {
+      if (!task?.taskId) return null;
+      tasks.set(String(task.taskId), {
+        ...task,
+        updatedAt: task.updatedAt || nowIso(),
+      });
+      schedulePersist();
+      return tasks.get(String(task.taskId));
+    },
+    async getTaskRecord(taskId) {
+      return tasks.get(String(taskId || "")) || null;
+    },
+    async listTaskRecords({ statuses = [], limit = 200 } = {}) {
+      const statusSet = new Set(
+        Array.isArray(statuses) ? statuses.map((status) => String(status)) : [],
+      );
+      return Array.from(tasks.values())
+        .filter((task) => statusSet.size === 0 || statusSet.has(String(task.status || "")))
+        .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")))
+        .slice(0, Math.max(1, Number(limit) || 200));
+    },
+    async close() {
+      persistNow();
+    },
   };
 }
 
 function createPostgresStore() {
   let pool = null;
+  let taskHistorySchemaReadyPromise = null;
 
   function getPool() {
     if (pool) return pool;
@@ -196,6 +319,82 @@ function createPostgresStore() {
 
   async function query(sql, params = []) {
     return getPool().query(sql, params);
+  }
+
+  async function ensureTaskHistorySchema() {
+    if (!taskHistorySchemaReadyPromise) {
+      taskHistorySchemaReadyPromise = (async () => {
+        await query(`
+          CREATE TABLE IF NOT EXISTS task_history (
+            task_id TEXT PRIMARY KEY,
+            item_id TEXT,
+            request_url TEXT NOT NULL,
+            requester_client_id BIGINT,
+            assigned_worker_client_id BIGINT,
+            status TEXT NOT NULL,
+            request_payload JSONB,
+            retry_count INT NOT NULL DEFAULT 0,
+            max_retries INT NOT NULL DEFAULT 0,
+            next_attempt_at TIMESTAMPTZ,
+            affiliate_url TEXT,
+            result JSONB,
+            raw_json JSONB,
+            error_message TEXT,
+            error_code TEXT,
+            parse_error TEXT,
+            started_at TIMESTAMPTZ,
+            ended_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        await query("CREATE INDEX IF NOT EXISTS idx_task_history_status_updated_at ON task_history(status, updated_at DESC)");
+        await query("CREATE INDEX IF NOT EXISTS idx_task_history_item_id ON task_history(item_id)");
+      })().catch((error) => {
+        taskHistorySchemaReadyPromise = null;
+        throw error;
+      });
+    }
+
+    return taskHistorySchemaReadyPromise;
+  }
+
+  async function withTaskHistoryRecovery(run) {
+    try {
+      return await run();
+    } catch (error) {
+      if (!isUndefinedTableError(error, "task_history")) {
+        throw error;
+      }
+
+      taskHistorySchemaReadyPromise = null;
+      await ensureTaskHistorySchema();
+      return run();
+    }
+  }
+
+  async function pruneTaskHistory(task) {
+    const perItemLimit = normalizeTaskHistoryLimit(config.taskHistoryPerItemLimit);
+    if (!shouldPruneTaskHistoryRecord(task, perItemLimit)) {
+      return 0;
+    }
+
+    const result = await withTaskHistoryRecovery(() => query(
+      `
+        DELETE FROM task_history
+        WHERE task_id IN (
+          SELECT task_id
+          FROM task_history
+          WHERE item_id = $1
+            AND status IN ('success', 'error')
+          ORDER BY updated_at DESC, created_at DESC, task_id DESC
+          OFFSET $2
+        )
+      `,
+      [String(task.itemId), perItemLimit],
+    ));
+
+    return Number(result.rowCount || 0);
   }
 
   return {
@@ -231,6 +430,7 @@ function createPostgresStore() {
       `);
       await query("CREATE INDEX IF NOT EXISTS idx_products_updated_at ON products(updated_at DESC)");
       await query("CREATE INDEX IF NOT EXISTS idx_price_history_item_time ON price_history(item_id, recorded_at DESC)");
+      await ensureTaskHistorySchema();
     },
     async getProduct(itemId) {
       const result = await query(
@@ -391,6 +591,117 @@ function createPostgresStore() {
       const result = await query("SELECT COUNT(*)::INT AS total FROM products");
       return result.rows[0]?.total || 0;
     },
+    async upsertTaskRecord(task) {
+      if (!task?.taskId) return null;
+
+      const result = await withTaskHistoryRecovery(() => query(
+        `
+          INSERT INTO task_history (
+            task_id,
+            item_id,
+            request_url,
+            requester_client_id,
+            assigned_worker_client_id,
+            status,
+            request_payload,
+            retry_count,
+            max_retries,
+            next_attempt_at,
+            affiliate_url,
+            result,
+            raw_json,
+            error_message,
+            error_code,
+            parse_error,
+            started_at,
+            ended_at,
+            created_at,
+            updated_at
+          )
+          VALUES (
+            $1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12::jsonb, $13::jsonb,
+            $14, $15, $16, $17, $18, COALESCE($19::timestamptz, NOW()), NOW()
+          )
+          ON CONFLICT (task_id) DO UPDATE SET
+            item_id = EXCLUDED.item_id,
+            request_url = EXCLUDED.request_url,
+            requester_client_id = EXCLUDED.requester_client_id,
+            assigned_worker_client_id = EXCLUDED.assigned_worker_client_id,
+            status = EXCLUDED.status,
+            request_payload = EXCLUDED.request_payload,
+            retry_count = EXCLUDED.retry_count,
+            max_retries = EXCLUDED.max_retries,
+            next_attempt_at = EXCLUDED.next_attempt_at,
+            affiliate_url = EXCLUDED.affiliate_url,
+            result = EXCLUDED.result,
+            raw_json = EXCLUDED.raw_json,
+            error_message = EXCLUDED.error_message,
+            error_code = EXCLUDED.error_code,
+            parse_error = EXCLUDED.parse_error,
+            started_at = EXCLUDED.started_at,
+            ended_at = EXCLUDED.ended_at,
+            updated_at = NOW()
+          RETURNING *
+        `,
+        [
+          task.taskId,
+          task.itemId || null,
+          task.requestUrl || task.itemId || "",
+          task.requesterClientId ?? null,
+          task.assignedWorkerClientId ?? null,
+          task.status || "queued",
+          JSON.stringify(task.requestPayload || null),
+          Number(task.retryCount || 0),
+          Number(task.maxRetries || 0),
+          task.nextAttemptAt || null,
+          task.affiliateUrl || null,
+          JSON.stringify(task.result ?? null),
+          JSON.stringify(parseRawJson(task.raw)),
+          task.error || null,
+          task.errorCode || null,
+          task.parseError || null,
+          task.startedAt || null,
+          task.endedAt || null,
+          task.createdAt || null,
+        ],
+      ));
+
+      await pruneTaskHistory(task);
+
+      return toTaskRecord(result.rows[0]);
+    },
+    async getTaskRecord(taskId) {
+      const result = await withTaskHistoryRecovery(() => query("SELECT * FROM task_history WHERE task_id = $1", [
+        String(taskId || ""),
+      ]));
+      return toTaskRecord(result.rows[0]);
+    },
+    async listTaskRecords({ statuses = [], limit = 200 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 200, 1000));
+      const statusValues = Array.isArray(statuses)
+        ? statuses.map((status) => String(status || "").trim()).filter(Boolean)
+        : [];
+      const params = [];
+      let where = "";
+
+      if (statusValues.length > 0) {
+        params.push(statusValues);
+        where = "WHERE status = ANY($1::text[])";
+      }
+
+      params.push(safeLimit);
+      const result = await withTaskHistoryRecovery(() => query(
+        `
+          SELECT *
+          FROM task_history
+          ${where}
+          ORDER BY updated_at DESC
+          LIMIT $${params.length}
+        `,
+        params,
+      ));
+      return result.rows.map(toTaskRecord);
+    },
   };
 }
 
@@ -409,6 +720,9 @@ function createProductStore() {
 const productStore = createProductStore();
 
 module.exports = {
+  isUndefinedTableError,
+  normalizeTaskHistoryLimit,
+  shouldPruneTaskHistoryRecord,
   createProductStore,
   productStore,
 };

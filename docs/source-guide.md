@@ -40,16 +40,22 @@ He thong hien tai tap trung vao 4 viec:
 ```text
 playwright-shopee/
   browser-context.js      Quan ly Chrome/Playwright context, detect captcha/block.
+  chrome-launcher.js      Kiem tra/mo Chrome CDP theo profile va port dang dung.
   api-stack.js            Chay nen server + worker, khong mo CLI, co auto restart child process.
   cli.js                  CLI nhap link hoac item id, poll task, in JSON va thoi gian.
   config.js               Doc .env va expose config dung chung.
   ecosystem.config.js     Cau hinh PM2 mau neu muon chay lau dai.
   logger.js               Ghi log ra console va logs/tasks.jsonl.
   playwright-worker.js    Worker attach Chrome, nhan task, lay data tu Shopee Affiliate.
+  profile-launcher.js     Prompt chon profile truoc khi chay login/stack/api/worker.
+  profile-manager.js      Luu registry profile, port CDP, profile mac dinh.
   product-store.js        Adapter luu product/raw/history vao PostgreSQL hoac file fallback.
+  providers/shopee/       Gom logic dac thu Shopee: parse input, build affiliate URL, normalize product.
   server.js               HTTP API + WebSocket relay + parse JSON response.
   stack.js                Chay server + worker + cli trong 1 terminal.
   task-store.js           Luu task trong RAM, status, duration.
+  task-presenter.js       Chuan hoa task response tra ve cho HTTP/CLI.
+  http-utils.js           Helper doc JSON body va dong goi HTTP response.
   validation.js           Validate request/worker payload.
   worker-login.js         Kiem tra profile Chrome da login Affiliate.
 ```
@@ -58,17 +64,39 @@ playwright-shopee/
 
 ### 3.1. Khoi dong
 
-1. Mo Chrome CDP:
+1. Chon profile:
 
 ```bash
-google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/shopee-cdp-profile
+npm run profiles
 ```
 
-2. Dang nhap Shopee truoc, xu ly captcha.
+Hoac chay thang:
 
-3. Dang nhap Shopee Affiliate, vao dashboard va cho on dinh.
+```bash
+npm run stack
+```
 
-4. Chay stack:
+`profile-launcher.js` se cho chon profile mac dinh, profile cu, hoac tao profile moi. Moi profile duoc luu rieng trong `.profiles/`. Neu repo da co `.browser-profile` cu thi lan dau se migrate sang `.profiles/default`.
+
+2. Mo Chrome CDP:
+
+```bash
+google-chrome --remote-debugging-port=<PORT_CUA_PROFILE> --user-data-dir=<THU_MUC_PROFILE>
+```
+
+Vi du profile `thanhhuy2`:
+
+```bash
+google-chrome --remote-debugging-port=9223 --user-data-dir=.profiles/thanhhuy2
+```
+
+Neu chay qua `npm run login` / `npm run stack` / `npm run api`, he thong co the tu thu mo Chrome CDP bang dung `BROWSER_PROFILE_DIR` va `BROWSER_CDP_URL` cua profile duoc chon.
+
+3. Dang nhap Shopee truoc, xu ly captcha.
+
+4. Dang nhap Shopee Affiliate, vao dashboard va cho on dinh.
+
+5. Chay stack:
 
 ```bash
 npm run stack
@@ -77,7 +105,8 @@ npm run stack
 `stack.js` se:
 
 - Kiem tra Chrome CDP tai `BROWSER_CDP_URL`.
-- Neu Chrome CDP chua mo, thu mo Chrome tu dong.
+- Neu Chrome CDP chua mo, thu mo Chrome tu dong bang user-data-dir cua profile dang chon.
+- In tong quan profile `ready/cooldown/disabled` luc khoi dong.
 - Khoi dong `server.js`.
 - Khoi dong `playwright-worker.js`.
 - Doi worker san sang.
@@ -91,12 +120,59 @@ npm run api
 
 `api-stack.js` se:
 
+- Nhan env da resolve tu `profile-launcher.js`.
+- In tong quan profile luc khoi dong.
 - Khoi dong `server.js`.
 - Doi server ready qua `/health`.
 - Khoi dong `playwright-worker.js`.
 - Doi worker ready neu co the.
 - Khong mo CLI.
 - Tu restart server/worker neu process con bi crash va `SERVICE_AUTO_RESTART=true`.
+
+### 3.1.1. Profile registry
+
+Registry profile nam trong:
+
+```text
+.profiles/profiles.json
+```
+
+Moi profile luu:
+
+- `name`: ten profile de nguoi dung chon.
+- `profileDir`: thu muc user data / persistent profile.
+- `cdpPort`: port CDP rieng neu dang dung che do CDP.
+- `lastUsedAt`: lan gan nhat duoc chon.
+- `status`: `ready`, `cooldown`, `disabled`.
+- `blockedUntil`: profile tam thoi khong duoc chon lai truoc thoi diem nay.
+- `failureCount`: so lan profile bi Shopee phat hien.
+- `successCount`: so lan profile duoc xac nhan healthy lai.
+- `switchCount`: so lan profile duoc chon lam profile hien tai.
+
+Khi chay bang CDP, profile moi se duoc cap port tiep theo tu `BROWSER_CDP_URL` goc trong `.env`.
+
+Co the xoa profile bang:
+
+```bash
+npm run profiles
+```
+
+hoac:
+
+```bash
+npm run profiles -- --delete-profile=<ten-profile>
+```
+
+Khi xoa, he thong se xoa entry trong registry va xoa ca thu muc du lieu cua profile do.
+
+Co the quan ly profile qua HTTP:
+
+- `GET /profiles`: xem tong quan profile.
+- `POST /profiles/:id/recover`: bo cooldown va dua profile ve `ready`.
+- `POST /profiles/:id/default`: dat profile mac dinh.
+- `POST /profiles/:id/disable`: disable profile.
+- `POST /profiles/:id/enable`: enable lai profile.
+- `POST /profiles/:id/cooldown`: dat cooldown thu cong.
 
 ### 3.2. Tao task
 
@@ -139,6 +215,7 @@ Task di qua cac trang thai:
 ```text
 queued -> running -> success
 queued -> running -> error
+queued -> running -> queued (retry)
 ```
 
 Trong `task-store.js`, moi task co:
@@ -157,6 +234,9 @@ Trong `task-store.js`, moi task co:
 - `durationMs`: tong thoi gian.
 - `queueMs`: thoi gian cho worker.
 - `processingMs`: thoi gian worker xu ly va lay JSON.
+- `retryCount`: so lan task da duoc retry.
+- `maxRetries`: gioi han retry.
+- `nextAttemptAt`: thoi diem retry tiep theo neu co.
 
 CLI se in:
 
@@ -179,8 +259,23 @@ CLI se in:
 - Parse raw response thanh JSON cuoi cung.
 - Luu result/raw/error vao task.
 - Push update ve CLI neu CLI dang ket noi.
+- Retry lai task cho cac loi tam thoi nhu mat CDP.
+- `task-queue.js` la queue factory chon `memory` hoac `bullmq`.
+- `task-queue-memory.js` giu queue trong process.
+- `task-queue-bullmq.js` dua queue sang Redis/BullMQ nhung van giu contract task hien tai.
+- Khi dung `bullmq`, Redis la noi giu pending/delayed jobs that su.
+- PostgreSQL luu `task_history` de giu task history va phuc hoi task active metadata sau restart.
+- Neu `bullmq` init that bai, system co the fallback ve `memory` qua `QUEUE_DRIVER_FALLBACK`.
+- Neu worker disconnect, task dang `queued/running` cua worker do se duoc requeue.
+- Keyword warm-up truoc khi vao affiliate co the doi bang `PROFILE_WARMUP_KEYWORDS`.
 
 ### 5.1. HTTP API
+
+Tat ca HTTP endpoint deu nen doc theo envelope moi:
+
+- Success: `ok: true`, `data`, tuy endpoint co the them `meta`.
+- Error: `ok: false`, `error.code`, `error.message`, `error.details`.
+- Backward compatible: cac field cu van duoc giu o top-level de script cu chua can sua ngay.
 
 `GET /health`
 
@@ -189,9 +284,20 @@ Tra ve trang thai server:
 ```json
 {
   "ok": true,
+  "data": {
+    "port": 8080,
+    "workerClients": 1,
+    "taskCount": 0,
+    "queueDriver": "memory",
+    "queueSize": 0,
+    "delayedQueueSize": 0
+  },
   "port": 8080,
   "workerClients": 1,
-  "taskCount": 0
+  "taskCount": 0,
+  "queueDriver": "memory",
+  "queueSize": 0,
+  "delayedQueueSize": 0
 }
 ```
 
@@ -249,6 +355,10 @@ Server se uu tien cache/DB cho tung item, item nao miss moi dua sang worker. Gio
 `GET /session`
 
 Tra trang thai worker/CDP/cache gan nhat: so worker dang ket noi, cache size, session da login hay dang loi.
+
+`GET /queue`
+
+Tra thong tin queue hien tai: driver dang dung, so job dang cho/delay, va snapshot task `queued/running` trong RAM task store.
 
 `POST /tasks/<taskId>/cancel`
 
@@ -365,13 +475,22 @@ File nay gom cac helper cho Chrome/Playwright:
 
 - `launchBrowserContext()`: chon CDP hoac persistent context.
 - `connectToChromeOverCdp()`: connect vao `BROWSER_CDP_URL`.
-- `launchPersistentBrowserContext()`: mo profile `.browser-profile`.
+- `launchPersistentBrowserContext()`: mo profile trong `.profiles/`, mac dinh la `.profiles/default`.
 - `findAffiliatePageInSession()`: tim tab Affiliate dang mo.
 - `waitForAffiliatePageInSession()`: cho den khi co tab Affiliate.
 - `detectBlockingIssue()`: doc URL/body de phat hien captcha/block.
 - `waitForAffiliatePageSettled()`: doi page on dinh theo `PAGE_SETTLE_MS`.
 
 Trong thuc te, CDP voi Chrome that dang on dinh hon persistent context rieng.
+
+## 8. Profile health va auto switch
+
+- Worker chi phat `SESSION_STATUS` khi dang crawl ma bi Shopee chan that su.
+- `stack.js` va `api-stack.js` poll `/session` de biet profile hien tai co dang bi block/captcha/loading issue khong.
+- Neu bi chan, profile hien tai se duoc dua vao cooldown theo backoff dan tu `PROFILE_COOLDOWN_MS` den `PROFILE_COOLDOWN_MAX_MS`.
+- He thong tim profile ke tiep dang `ready`, bo qua profile dang cooldown.
+- Worker moi se duoc restart bang profile da duoc chon lai.
+- Profile moi co the warm-up sau hon qua `shopee.vn`, `mall`, `search` truoc khi vao Affiliate.
 
 ## 8. Vai tro cua stack.js
 

@@ -221,19 +221,19 @@ function printTasksList(payload) {
   }
 }
 
-async function pollTaskUntilDone(taskId) {
-  let lastStatus = null;
+async function pollTaskUntilDone(taskId, initialStatus = null) {
+  let lastStatus = initialStatus;
 
   for (;;) {
     const task = await fetchTask(taskId);
 
+    if (DONE_STATUSES.has(task.status)) {
+      return task;
+    }
+
     if (task.status !== lastStatus) {
       printTaskStatus(task);
       lastStatus = task.status;
-    }
-
-    if (DONE_STATUSES.has(task.status)) {
-      return task;
     }
 
     await new Promise((resolve) => setTimeout(resolve, config.taskPollMs));
@@ -317,7 +317,7 @@ async function handleInput(line) {
     console.log(`Da gui task: ${queuedTask.taskId}`);
     printTaskStatus(queuedTask);
 
-    const finalTask = await pollTaskUntilDone(queuedTask.taskId);
+    const finalTask = await pollTaskUntilDone(queuedTask.taskId, queuedTask.status);
     const observedDurationMs = Date.now() - startedAtMs;
     finalTask.durationMs =
       Number.isFinite(finalTask.durationMs) && finalTask.durationMs > 0

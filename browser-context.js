@@ -171,6 +171,63 @@ async function waitForAffiliatePageSettled(page, timeoutMs = config.pageSettleMs
   } catch {}
 }
 
+async function warmUpShopeeSession(page, options = {}) {
+  if (!config.profileWarmupEnabled) {
+    return {
+      warmed: false,
+      skipped: true,
+      reason: "disabled",
+    };
+  }
+
+  const targetUrl = String(options.targetUrl || "https://shopee.vn").trim();
+  const waitMs = Math.max(
+    config.pageSettleMs,
+    Number(options.waitMs || config.profileWarmupDelayMs),
+  );
+  const keywordUrls = config.profileWarmupKeywords.map(
+    (keyword) =>
+      `https://shopee.vn/search?keyword=${encodeURIComponent(keyword)}`,
+  );
+  const warmupUrls =
+    Array.isArray(options.warmupUrls) && options.warmupUrls.length > 0
+      ? options.warmupUrls
+      : [
+          targetUrl,
+          "https://shopee.vn/mall",
+          ...keywordUrls,
+        ];
+
+  for (const url of warmupUrls) {
+    await page.goto(url, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(waitMs);
+    await waitForAffiliatePageSettled(page, waitMs);
+
+    const blockingIssue = await detectBlockingIssue(page);
+    if (blockingIssue) {
+      return {
+        warmed: false,
+        skipped: false,
+        blockingIssue,
+        currentUrl: page.url(),
+        visitedUrls: warmupUrls,
+      };
+    }
+
+    if (!config.profileWarmupDeepEnabled) {
+      break;
+    }
+  }
+
+  return {
+    warmed: true,
+    skipped: false,
+    blockingIssue: null,
+    currentUrl: page.url(),
+    visitedUrls: warmupUrls,
+  };
+}
+
 function isAffiliateRelatedUrl(url) {
   const value = String(url || "").toLowerCase();
   return (
@@ -246,6 +303,7 @@ module.exports = {
   launchBrowserContext,
   listSessionPageUrls,
   looksLikeLoggedOutUrl,
+  warmUpShopeeSession,
   waitForAffiliatePageSettled,
   waitForAffiliatePageInSession,
 };

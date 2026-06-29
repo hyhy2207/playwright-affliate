@@ -5,6 +5,13 @@ const WebSocket = require("ws");
 const { config } = require("./config");
 const { logger } = require("./logger");
 const {
+  TARGET_API_PATH,
+  buildAffiliateUrl,
+} = require("./providers/shopee/affiliate");
+const {
+  extractItemIdFromInput,
+} = require("./providers/shopee/input");
+const {
   detectBlockingIssue,
   findAffiliatePageInSession,
   launchBrowserContext,
@@ -14,8 +21,6 @@ const {
   waitForAffiliatePageInSession,
 } = require("./browser-context");
 
-const TARGET_API_PATH = "affiliate.shopee.vn/api/v3/offer/product";
-
 let socket;
 let reconnectTimer = null;
 let browserSessionPromise = null;
@@ -23,25 +28,10 @@ let hasValidatedProfile = false;
 let registerRetryTimer = null;
 let isRegisteringWorker = false;
 let activeTaskPagePromise = null;
+let lastTaskStartedAt = 0;
 
 const taskQueue = [];
 let isProcessingTask = false;
-
-function extractItemId(shopeeUrl) {
-  const match1 = shopeeUrl.match(/i\.(\d+)\.(\d+)/);
-  if (match1 && match1[2]) return match1[2];
-
-  const match2 = shopeeUrl.match(/\/product\/\d+\/(\d+)/);
-  if (match2 && match2[1]) return match2[1];
-
-  try {
-    const urlObj = new URL(shopeeUrl);
-    const itemId = urlObj.searchParams.get("item_id");
-    if (itemId) return itemId;
-  } catch {}
-
-  return null;
-}
 
 function sendSocketMessage(payload) {
   if (socket && socket.readyState === WebSocket.OPEN) {
@@ -101,10 +91,15 @@ function sendSessionStatus(patch) {
     affiliateLoggedIn: false,
     currentUrl: null,
     mode: null,
+    profileName: process.env.PROFILE_NAME || null,
     profileDir: config.browserProfileDir,
     message: null,
     ...patch,
   });
+}
+
+function shouldBroadcastSessionFailure(code) {
+  return code === "CAPTCHA_REQUIRED" || code === "LOADING_ISSUE";
 }
 
 async function getBrowserContext() {
@@ -191,6 +186,7 @@ async function ensureProfileLoggedIn() {
     logger.info("worker.profile_ready", {
       currentUrl,
       mode: browserSession.mode,
+      profileName: process.env.PROFILE_NAME || null,
       profileDir: config.browserProfileDir,
     });
     sendSessionStatus({
@@ -198,18 +194,16 @@ async function ensureProfileLoggedIn() {
       affiliateLoggedIn: true,
       currentUrl,
       mode: browserSession.mode,
-      message: "Profile affiliate san sang",
+      profileName: process.env.PROFILE_NAME || null,
+      profileDir: config.browserProfileDir,
+      message: "Profile Playwright da san sang",
+      errorCode: null,
     });
   } finally {
     if (shouldClosePage) {
       await page.close().catch(() => {});
     }
   }
-}
-
-function buildAffiliateUrl(itemId) {
-  const base = config.affiliateBaseUrl.replace(/\/$/, "");
-  return `${base}/offer/product_offer/${itemId}`;
 }
 
 async function tryFetchAffiliateProductApi(page, itemId) {
@@ -330,7 +324,7 @@ async function handleTask(payload) {
   } = payload;
   const itemId =
     (typeof payloadItemId === "string" && payloadItemId.trim()) ||
-    extractItemId(requestUrl);
+    extractItemIdFromInput(requestUrl);
   const requestRef = requestUrl || itemId;
 
   if (!itemId) {
@@ -344,7 +338,7 @@ async function handleTask(payload) {
     return;
   }
 
-  const affiliateUrl = buildAffiliateUrl(itemId);
+  const affiliateUrl = buildAffiliateUrl(config.affiliateBaseUrl, itemId);
   sendSocketMessage({
     type: "STARTED",
     taskId,
@@ -353,6 +347,13 @@ async function handleTask(payload) {
   });
 
   try {
+
+    const waitGapMs = config.profileMinTaskGapMs - (Date.now() - lastTaskStartedAt);
+    if (waitGapMs > 0) {
+      await sleep(waitGapMs);
+    }
+    lastTaskStartedAt = Date.now();
+
     const browserSession = await getBrowserSession();
     const page = await getActiveTaskPage(browserSession);
     let requestFailedHandler = null;
@@ -375,6 +376,16 @@ async function handleTask(payload) {
           itemId,
           apiFetchMs: fastApiResult.apiFetchMs,
           attempts: fastApiResult.attempts,
+        });
+        sendSessionStatus({
+          workerReady: true,
+          affiliateLoggedIn: true,
+          currentUrl: page.url(),
+          mode: browserSession.mode,
+          profileName: process.env.PROFILE_NAME || null,
+          profileDir: config.browserProfileDir,
+          message: "Worker dang crawl binh thuong",
+          errorCode: null,
         });
         sendSocketMessage({
           type: "SUCCESS",
@@ -433,6 +444,16 @@ async function handleTask(payload) {
         gotoMs,
         responseStatus: response.status(),
       });
+      sendSessionStatus({
+        workerReady: true,
+        affiliateLoggedIn: true,
+        currentUrl: page.url(),
+        mode: browserSession.mode,
+        profileName: process.env.PROFILE_NAME || null,
+        profileDir: config.browserProfileDir,
+        message: "Worker dang crawl binh thuong",
+        errorCode: null,
+      });
 
       sendSocketMessage({
         type: "SUCCESS",
@@ -455,6 +476,16 @@ async function handleTask(payload) {
       code,
       message: error.message,
     });
+
+    if (shouldBroadcastSessionFailure(code)) {
+      hasValidatedProfile = false;
+      sendSessionStatus({
+        workerReady: false,
+        affiliateLoggedIn: false,
+        errorCode: code,
+        message: error.message,
+      });
+    }
   }
 }
 
@@ -492,11 +523,6 @@ function tryRegisterWorker() {
 
   if (hasValidatedProfile) {
     sendSocketMessage({ type: "REGISTER_WORKER" });
-    sendSessionStatus({
-      workerReady: true,
-      affiliateLoggedIn: true,
-      message: "Profile affiliate da validate truoc do",
-    });
     return;
   }
 
@@ -509,12 +535,6 @@ function tryRegisterWorker() {
     .catch((error) => {
       logger.error("worker.login_required", {
         message: error.message,
-      });
-      sendSessionStatus({
-        workerReady: false,
-        affiliateLoggedIn: false,
-        message: error.message,
-        errorCode: classifyWorkerError(error),
       });
       scheduleWorkerRegistration();
     })
@@ -562,6 +582,22 @@ function connectSocket() {
 
       if (payload.type === "REGISTERED") {
         hasValidatedProfile = true;
+        void getBrowserSession()
+          .then(async (browserSession) => {
+            const found = await findAffiliatePageInSession(browserSession);
+            const currentUrl = found.page?.url?.() || null;
+            sendSessionStatus({
+              workerReady: true,
+              affiliateLoggedIn: true,
+              currentUrl,
+              mode: browserSession.mode,
+              profileName: process.env.PROFILE_NAME || null,
+              profileDir: config.browserProfileDir,
+              message: "Worker da dang ky va san sang crawl",
+              errorCode: null,
+            });
+          })
+          .catch(() => {});
         logger.info("worker.registered", {
           role: payload.role,
         });
