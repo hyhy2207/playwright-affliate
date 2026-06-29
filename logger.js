@@ -54,6 +54,34 @@ function formatConsoleLine(entry) {
       return `${prefix} Task ${entry.taskId} thanh cong | ${entry.productName} | ${entry.price} | parse ${entry.parseMs ?? "-"}ms`;
     case "task.failed":
       return `${prefix} Task ${entry.taskId} that bai${entry.errorCode ? ` (${entry.errorCode})` : ""}: ${entry.message}`;
+    case "task.retry_scheduled":
+      return `${prefix} Task ${entry.taskId} se retry lan ${entry.retryCount} | worker #${entry.workerClientId || "-"} | ${shorten(entry.reason || "")}`;
+    case "task.history_upsert_failed":
+      return `${prefix} Luu task history ${entry.taskId || "-"} vao store loi: ${entry.message}`;
+    case "task.store_restored":
+      return `${prefix} Da phuc hoi ${entry.restored} task active tu ${entry.driver}`;
+    case "task.store_restore_failed":
+      return `${prefix} Phuc hoi task active tu ${entry.driver} loi: ${entry.message}`;
+    case "task.queue_driver_ready":
+      return `${prefix} Queue driver san sang (${entry.driver}) | ${entry.queuePrefix || "-"}:${entry.queueName || "-"}`;
+    case "task.queue_driver_fallback":
+      return `${prefix} Queue driver fallback ${entry.requestedDriver} -> ${entry.fallbackDriver}: ${entry.message}`;
+    case "task.queue_job_enqueued":
+      return `${prefix} Queue job ${entry.taskId} duoc dua vao ${entry.driver} | delay=${entry.delayMs ?? 0}ms`;
+    case "task.queue_job_activated":
+      return `${prefix} Queue job ${entry.taskId} da san sang dispatch tu ${entry.driver}`;
+    case "task.queue_job_removed":
+      return `${prefix} Queue job ${entry.taskId} da bi xoa khoi ${entry.driver}`;
+    case "task.queue_refresh_failed":
+      return `${prefix} Queue refresh loi (${entry.driver}): ${entry.message}`;
+    case "task.queue_enqueue_failed":
+      return `${prefix} Queue enqueue loi task ${entry.taskId} (${entry.driver}): ${entry.message}`;
+    case "task.queue_remove_failed":
+      return `${prefix} Queue remove loi task ${entry.taskId} (${entry.driver}): ${entry.message}`;
+    case "task.queue_worker_error":
+      return `${prefix} Queue worker loi (${entry.driver}): ${entry.message}`;
+    case "task.queue_job_failed":
+      return `${prefix} Queue job ${entry.taskId || "-"} that bai (${entry.driver}): ${entry.message}`;
     case "task.cancelled":
       return `${prefix} Task ${entry.taskId} da huy`;
     case "task.timed_out":
@@ -84,11 +112,13 @@ function formatConsoleLine(entry) {
     case "worker.invalid_message":
       return `${prefix} Worker nhan message khong hop le: ${entry.message}`;
     case "worker.profile_ready":
-      return `${prefix} Profile Playwright san sang | ${shorten(entry.currentUrl)}`;
+      return `${prefix} Profile Playwright san sang${entry.profileName ? ` (${entry.profileName})` : ""} | ${shorten(entry.currentUrl)}`;
+    case "profile.auto_switch":
+      return `${prefix} Auto switch profile ${entry.fromProfile || "-"} -> ${entry.toProfile || "-"}: ${shorten(entry.reason || "")}`;
     case "worker.login_required":
       return `${prefix} Profile Playwright chua login affiliate: ${entry.message}`;
     case "worker.session_status":
-      return `${prefix} Session worker | ready=${entry.workerReady} | login=${entry.affiliateLoggedIn} | ${shorten(entry.currentUrl || entry.message || "")}`;
+      return `${prefix} Session worker${entry.profileName ? ` (${entry.profileName})` : ""} | ready=${entry.workerReady} | login=${entry.affiliateLoggedIn} | ${shorten(entry.currentUrl || entry.message || "")}`;
     case "worker.fast_api_hit":
       return `${prefix} Fast API hit task ${entry.taskId} | ${entry.apiFetchMs}ms`;
     case "worker.fast_api_fallback":
@@ -97,6 +127,8 @@ function formatConsoleLine(entry) {
       return `${prefix} Fallback goto task ${entry.taskId} | ${entry.gotoMs}ms`;
     case "task.orphan_success":
       return `${prefix} Nhan SUCCESS cho task khong ton tai: ${entry.taskId}`;
+    case "task.journal_restored":
+      return `${prefix} Da phuc hoi ${entry.restored} task pending tu journal`;
     case "logger.file_logging_disabled":
       return `${prefix} Khong ghi duoc file log: ${entry.message}`;
     default: {

@@ -7,11 +7,13 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "cli": "node cli.js",
-    "worker": "node playwright-worker.js",
-    "stack": "node stack.js",
-    "api": "node api-stack.js",
-    "login": "node worker-login.js",
-    "check": "node --check server.js && node --check cli.js && node --check config.js && node --check logger.js && node --check validation.js && node --check task-store.js && node --check product-store.js && node --check playwright-worker.js && node --check worker-login.js && node --check stack.js && node --check api-stack.js"
+    "profiles": "node profile-launcher.js --profiles",
+    "worker": "node profile-launcher.js playwright-worker.js",
+    "stack": "node profile-launcher.js stack.js",
+    "api": "node profile-launcher.js api-stack.js",
+    "login": "node profile-launcher.js worker-login.js",
+    "test": "node --test test/*.test.js",
+    "check": "node --check server.js && node --check cli.js && node --check config.js && node --check logger.js && node --check validation.js && node --check task-store.js && node --check task-queue.js && node --check task-queue-memory.js && node --check task-queue-bullmq.js && node --check product-store.js && node --check playwright-worker.js && node --check worker-login.js && node --check stack.js && node --check api-stack.js && node --check chrome-launcher.js && node --check profile-manager.js && node --check profile-launcher.js"
   },
   "keywords": [
     "playwright",
@@ -22,6 +24,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "bullmq": "^5.79.2",
+    "ioredis": "^5.11.1",
     "pg": "^8.16.3",
     "playwright": "^1.54.2",
     "ws": "^8.21.0"

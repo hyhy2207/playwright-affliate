@@ -8,6 +8,11 @@ function isValidItemId(value) {
   return typeof value === "string" && /^\d+$/.test(value.trim());
 }
 
+function isValidShopeeHostname(hostname) {
+  const normalized = String(hostname || "").trim().toLowerCase();
+  return normalized === "shopee.vn" || normalized.endsWith(".shopee.vn");
+}
+
 function validateScrapeRequest(payload) {
   if (!payload || typeof payload !== "object") {
     return { ok: false, message: "Payload phai la object JSON" };
@@ -27,7 +32,7 @@ function validateScrapeRequest(payload) {
 
   try {
     const parsed = new URL(payload.url);
-    if (!parsed.hostname.includes("shopee.vn")) {
+    if (!isValidShopeeHostname(parsed.hostname)) {
       return { ok: false, message: "url phai tro toi shopee.vn" };
     }
   } catch {
@@ -59,6 +64,7 @@ function validateExtensionResult(payload) {
 
 module.exports = {
   isValidItemId,
+  isValidShopeeHostname,
   validateScrapeRequest,
   validateExtensionResult,
 };

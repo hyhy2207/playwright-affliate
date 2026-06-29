@@ -9,7 +9,38 @@ const WebSocket = require("ws");
 
 const { config } = require("./config");
 const { logger } = require("./logger");
+const {
+  extractItemIdFromInput,
+  getRequestItemId,
+  parseWsCommand: parseShopeeWsCommand,
+} = require("./providers/shopee/input");
+const { normalizeShopeeProduct } = require("./providers/shopee/normalize-product");
+const {
+  buildProductPayload,
+  buildStoreProductEntry,
+  buildTaskProductPayload,
+  normalizeOutputMode,
+} = require("./providers/shopee/output");
+const {
+  buildErrorMessage,
+  normalizeHttpPayload,
+  normalizeListQueryValue,
+  readBooleanQuery,
+  readJsonBody,
+  sendHttpJson,
+} = require("./http-utils");
+const {
+  disableProfile,
+  findProfileByNameOrId,
+  loadProfiles,
+  recoverProfile,
+  setDefaultProfile,
+  summarizeProfiles,
+  updateProfileState,
+} = require("./profile-manager");
 const { productStore } = require("./product-store");
+const { buildTaskResponse } = require("./task-presenter");
+const { createTaskQueue, createTaskQueueWithFallback } = require("./task-queue");
 const { taskStore, TASK_STATUS } = require("./task-store");
 const {
   isValidItemId,
@@ -21,209 +52,23 @@ let nextClientId = 1;
 
 const requesterSockets = new Map();
 const productCache = new Map();
+let taskQueue = createTaskQueue({ taskStore, logger, config });
 
 let latestWorkerSession = {
   workerReady: false,
   affiliateLoggedIn: false,
   currentUrl: null,
   mode: null,
+  profileName: null,
   profileDir: null,
   message: null,
   updatedAt: null,
 };
 
-const PRODUCT_OUTPUT_MODES = new Set(["compact", "full", "raw"]);
-
-function toNumber(value, fallback = 0) {
-  const numeric =
-    typeof value === "number"
-      ? value
-      : Number(String(value ?? "").replace(/[^\d.-]/g, ""));
-
-  return Number.isFinite(numeric) ? numeric : fallback;
-}
-
-function normalizeMoneyValue(value, fallback = 0) {
-  const numeric = toNumber(value, fallback);
-  return numeric > 100000 ? Math.round(numeric / 100000) : numeric;
-}
-
-function toBoolean(value) {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "number") return value !== 0;
-  if (typeof value === "string") {
-    const normalized = value.trim().toLowerCase();
-    return normalized === "true" || normalized === "1" || normalized === "yes";
-  }
-  return false;
-}
-
-function buildShopeeImageUrl(image) {
-  const value = String(image || "").trim();
-  if (!value) return "";
-  if (/^https?:\/\//i.test(value)) return value;
-  return `https://cf.shopee.vn/file/${value}`;
-}
-
-function normalizeCommissionFallback(rawCommission, fallbackCommission) {
-  const commission = toNumber(rawCommission, fallbackCommission);
-  if (commission <= 0) return fallbackCommission;
-
-  const rawValue = String(rawCommission ?? "").trim();
-  const hasDecimalPart = rawValue.includes(".") && !rawValue.includes(",");
-
-  // Some affiliate responses return commission in "thousand VND" format
-  // (for example 12.75 -> 12,750 VND) when final commission fields are absent.
-  if (hasDecimalPart && commission < 1000) {
-    return Math.round(commission * 1000);
-  }
-
-  return commission;
-}
-
-function normalizeCommissionValue(value, fallback = 0) {
-  return normalizeCommissionFallback(value, fallback);
-}
-
-function normalizeShopeeProduct(rawData) {
-  const raw = typeof rawData === "string" ? JSON.parse(rawData) : rawData;
-
-  const data = raw?.data || {};
-  const item =
-    data?.batch_item_for_item_card_full ||
-    data?.item ||
-    data?.product ||
-    data?.itemCard ||
-    {};
-
-  if (!data || !item) {
-    throw new Error("Response khong dung dinh dang Shopee Affiliate API");
-  }
-
-  const rawPrice =
-    item.price ??
-    item.price_info?.price ??
-    item.priceMin ??
-    item.current_price ??
-    0;
-  const price = normalizeMoneyValue(rawPrice);
-  const minPrice = normalizeMoneyValue(
-    item.price_min ?? item.priceMin ?? rawPrice
-  );
-  const maxPrice = normalizeMoneyValue(
-    item.price_max ?? item.priceMax ?? rawPrice
-  );
-  const sellerComFinal = toNumber(
-    data.seller_com_final ??
-      data.sellerComFinal ??
-      data.sellerCommissionFinal ??
-      data.sellerCommission ??
-      data.seller_comission
-  );
-  const shopeeComFinal = toNumber(
-    data.shopee_com_final ??
-      data.shopeeComFinal ??
-      data.shopeeCommissionFinal ??
-      data.shopeeCommission ??
-      data.platformCommission
-  );
-  const extraCommission = sellerComFinal || normalizeCommissionValue(
-    data.commission_rate?.seller_commission ??
-      data.commissionRate?.seller_commission ??
-      data.commissionRate?.sellerCommission,
-    0
-  );
-  const shopeeCommission = shopeeComFinal || normalizeCommissionValue(
-    data.commission_rate?.shopee_commission ??
-      data.commissionRate?.shopee_commission ??
-      data.commissionRate?.shopeeCommission,
-    0
-  );
-  const fallbackCommission = sellerComFinal + shopeeComFinal;
-  const finalCommissionValue =
-    data.commission_final ??
-    data.commissionFinal ??
-    data.total_commission ??
-    data.totalCommission ??
-    data.finalCommission;
-  const commission =
-    finalCommissionValue != null
-      ? toNumber(finalCommissionValue, fallbackCommission)
-      : fallbackCommission > 0
-        ? fallbackCommission
-        : normalizeCommissionFallback(data.commission, fallbackCommission);
-  const productLink =
-    data.product_link ||
-    data.productLink ||
-    item.product_link ||
-    item.offerLink ||
-    "";
-
-  const product = {
-    productID: String(item.itemid ?? item.item_id ?? data.item_id ?? data.itemId ?? ""),
-    price,
-    minPrice,
-    maxPrice,
-    sales: toNumber(item.sold ?? item.sales ?? item.historical_sold),
-    totalSales: toNumber(item.historical_sold ?? item.sold ?? item.sales),
-    rating: Number(
-      item.item_rating?.rating_star || item.rating_star || item.rating || 0
-    ).toFixed(2),
-    imageUrl: buildShopeeImageUrl(item.image || item.imageUrl || item.image_url),
-    shopName: item.shop_name || item.shopName || data.shop_name || "",
-    commission,
-    hasExtraCommission: extraCommission > 0,
-    extraCommission,
-    hasShopeeCommission: shopeeCommission > 0,
-    shopeeCommission,
-    productLink,
-    productName: item.name || item.productName || "",
-  };
-
-  if (!product.productID || !product.productName || !product.productLink) {
-    throw new Error("Response khong dung dinh dang Shopee Affiliate API");
-  }
-
-  return product;
-}
-
-function parseRawJson(rawData) {
-  if (typeof rawData !== "string") return rawData;
-
-  try {
-    return JSON.parse(rawData);
-  } catch {
-    return rawData;
-  }
-}
-
-function normalizeOutputMode(value) {
-  const mode = String(value || "compact").trim().toLowerCase();
-  return PRODUCT_OUTPUT_MODES.has(mode) ? mode : "compact";
-}
-
-function extractItemIdFromInput(value) {
-  const input = String(value || "").trim();
-  if (!input) return "";
-  if (isValidItemId(input)) return input;
-
-  const pathMatch = input.match(/\/product\/\d+\/(\d+)/);
-  if (pathMatch?.[1]) return pathMatch[1];
-
-  const seoMatch = input.match(/i\.\d+\.(\d+)/);
-  if (seoMatch?.[1]) return seoMatch[1];
-
-  try {
-    const parsed = new URL(input);
-    return parsed.searchParams.get("item_id") || "";
-  } catch {
-    return "";
-  }
-}
-
-function getRequestItemId(payload) {
-  return extractItemIdFromInput(payload.itemId || payload.url || "");
-}
+const RETRYABLE_ERROR_CODES = new Set([
+  "WORKER_ERROR",
+  "CDP_DISCONNECTED",
+]);
 
 function getCachedProduct(itemId) {
   const cached = productCache.get(String(itemId || ""));
@@ -235,19 +80,6 @@ function getCachedProduct(itemId) {
   }
 
   return cached;
-}
-
-function buildStoreProductEntry(record) {
-  if (!record) return null;
-
-  return {
-    itemId: String(record.itemId),
-    result: record.result,
-    raw: record.raw,
-    affiliateUrl: record.affiliateUrl,
-    cachedAt: record.updatedAt,
-    cachedAtMs: record.updatedAt ? new Date(record.updatedAt).getTime() : Date.now(),
-  };
 }
 
 function setCachedProduct(product, raw, affiliateUrl) {
@@ -279,46 +111,35 @@ async function persistProduct(product, raw, affiliateUrl, source = "worker") {
   }
 }
 
-function buildProductPayload(entry, mode = "compact") {
-  const normalizedMode = normalizeOutputMode(mode);
-
-  if (normalizedMode === "raw") {
-    return parseRawJson(entry.raw);
+async function persistTaskRecord(task) {
+  if (!task?.taskId || typeof productStore.upsertTaskRecord !== "function") {
+    return;
   }
 
-  if (normalizedMode === "full") {
-    return {
-      ...entry.result,
-      raw: parseRawJson(entry.raw),
-      cache: entry.cachedAt
-        ? {
-            itemId: entry.itemId,
-            cachedAt: entry.cachedAt,
-            ttlMs: config.productCacheTtlMs,
-          }
-        : null,
-    };
+  try {
+    await productStore.upsertTaskRecord(task);
+  } catch (error) {
+    logger.warn("task.history_upsert_failed", {
+      taskId: task.taskId,
+      message: error.message,
+    });
   }
-
-  return entry.result;
 }
 
-function createTaskCacheEntry(task) {
-  if (!task?.result?.productID) return null;
+async function markTaskHistoryStale(task, errorCode, errorMessage) {
+  if (!task?.taskId) return null;
 
-  return {
-    itemId: String(task.result.productID),
-    result: task.result,
-    raw: task.raw,
-    affiliateUrl: task.affiliateUrl,
-    cachedAt: null,
-    cachedAtMs: Date.now(),
+  const staleTask = {
+    ...task,
+    status: TASK_STATUS.ERROR,
+    errorCode,
+    error: errorMessage,
+    endedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
   };
-}
 
-function buildTaskProductPayload(task, mode = "compact") {
-  const entry = createTaskCacheEntry(task);
-  return entry ? buildProductPayload(entry, mode) : task?.result || null;
+  await persistTaskRecord(staleTask);
+  return staleTask;
 }
 
 function waitForTaskDone(taskId, timeoutMs) {
@@ -342,17 +163,6 @@ function waitForTaskDone(taskId, timeoutMs) {
 
     tick();
   });
-}
-
-function readBooleanQuery(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  return normalized === "1" || normalized === "true" || normalized === "yes";
-}
-
-function normalizeListQueryValue(value, fallback, max) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(0, Math.min(Math.floor(parsed), max));
 }
 
 async function readProductStoreSize() {
@@ -379,7 +189,9 @@ async function fetchProductByItemId(itemId, mode, options = {}) {
           source: "memory",
           itemId,
           mode,
-          result: buildProductPayload(cached, mode),
+          result: buildProductPayload(cached, mode, {
+            productCacheTtlMs: config.productCacheTtlMs,
+          }),
           cachedAt: cached.cachedAt,
           durationMs: Date.now() - startedAt,
         },
@@ -399,7 +211,9 @@ async function fetchProductByItemId(itemId, mode, options = {}) {
           source: productStore.driver,
           itemId,
           mode,
-          result: buildProductPayload(entry, mode),
+          result: buildProductPayload(entry, mode, {
+            productCacheTtlMs: config.productCacheTtlMs,
+          }),
           cachedAt: stored.updatedAt,
           durationMs: Date.now() - startedAt,
         },
@@ -431,8 +245,10 @@ async function fetchProductByItemId(itemId, mode, options = {}) {
         source: queued.fromCache ? "memory" : "worker",
         itemId,
         mode,
-        result: buildTaskProductPayload(task, mode),
-        task: buildTaskResponse(task),
+        result: buildTaskProductPayload(task, mode, {
+          productCacheTtlMs: config.productCacheTtlMs,
+        }),
+        task: buildTaskResponse(task, { defaultMaxRetries: config.taskMaxRetries }),
         durationMs: Date.now() - startedAt,
       },
     };
@@ -446,7 +262,7 @@ async function fetchProductByItemId(itemId, mode, options = {}) {
         itemId,
         error: task.error,
         errorCode: task.errorCode,
-        task: buildTaskResponse(task),
+        task: buildTaskResponse(task, { defaultMaxRetries: config.taskMaxRetries }),
         durationMs: Date.now() - startedAt,
       },
     };
@@ -458,7 +274,9 @@ async function fetchProductByItemId(itemId, mode, options = {}) {
       type: "QUEUED",
       message: "Task dang xu ly, lay ket qua bang /tasks/:taskId",
       itemId,
-      task: task ? buildTaskResponse(task) : buildTaskResponse(queued.task),
+      task: task
+        ? buildTaskResponse(task, { defaultMaxRetries: config.taskMaxRetries })
+        : buildTaskResponse(queued.task, { defaultMaxRetries: config.taskMaxRetries }),
       durationMs: Date.now() - startedAt,
     },
   };
@@ -517,6 +335,19 @@ function registerTask(payload, requester) {
     status: TASK_STATUS.QUEUED,
   });
 
+  task.itemId = getRequestItemId(payload) || null;
+  task.requestPayload = {
+    taskId: payload.taskId,
+    url: payload.url || "",
+    itemId:
+      typeof payload.itemId === "string" && payload.itemId.trim()
+        ? payload.itemId.trim()
+        : "",
+  };
+  task.retryCount = Number(payload.retryCount || 0);
+  task.maxRetries = Number(payload.maxRetries || config.taskMaxRetries);
+  void persistTaskRecord(task);
+
   if (requester) {
     requesterSockets.set(payload.taskId, requester);
   }
@@ -544,6 +375,10 @@ function clearTasksForSocket(ws) {
       clearRequesterSocket(task.taskId);
     }
   }
+
+  if (ws.meta?.role === "worker") {
+    requeueTasksForWorker(ws.meta.clientId);
+  }
 }
 
 function parseIncomingMessage(raw) {
@@ -554,65 +389,26 @@ function parseIncomingMessage(raw) {
   }
 }
 
-function isLikelyShopeeUrl(value) {
-  return typeof value === "string" && /^https?:\/\/([a-z0-9-]+\.)?shopee\.vn\//i.test(value.trim());
-}
-
-function isLikelyItemId(value) {
-  return isValidItemId(typeof value === "string" ? value.trim() : value);
-}
-
 function parseWsCommand(rawText) {
-  const input = String(rawText || "").trim();
-  if (!input) return null;
+  const parsed = parseShopeeWsCommand(rawText);
+  if (!parsed?.payload) return null;
 
-  if (isLikelyItemId(input)) {
-    return {
-      payload: {
-        taskId: crypto.randomUUID(),
-        itemId: input,
-      },
-    };
-  }
-
-  if (isLikelyShopeeUrl(input)) {
-    return {
-      payload: {
-        taskId: crypto.randomUUID(),
-        url: input,
-      },
-    };
-  }
-
-  const scrapeMatch = input.match(/^scrape\s+(.+)$/i);
-  if (scrapeMatch && isLikelyShopeeUrl(scrapeMatch[1])) {
-    return {
-      payload: {
-        taskId: crypto.randomUUID(),
-        url: scrapeMatch[1].trim(),
-      },
-    };
-  }
-
-  if (scrapeMatch && isLikelyItemId(scrapeMatch[1])) {
-    return {
-      payload: {
-        taskId: crypto.randomUUID(),
-        itemId: scrapeMatch[1].trim(),
-      },
-    };
-  }
-
-  return null;
+  return {
+    payload: {
+      taskId: crypto.randomUUID(),
+      ...parsed.payload,
+    },
+  };
 }
 
-function buildErrorMessage(message, extra = {}) {
-  return {
-    type: "ERROR",
-    status: TASK_STATUS.ERROR,
-    message,
-    ...extra,
-  };
+function getProfileIdFromPath(pathname, suffix = "") {
+  const prefix = "/profiles/";
+  if (!pathname.startsWith(prefix)) return "";
+
+  const raw = suffix && pathname.endsWith(suffix)
+    ? pathname.slice(prefix.length, -suffix.length)
+    : pathname.slice(prefix.length);
+  return decodeURIComponent(raw).trim();
 }
 
 function isCompletedTask(task) {
@@ -620,8 +416,84 @@ function isCompletedTask(task) {
 }
 
 function updateTask(taskId, patch) {
-  return taskStore.updateTask(taskId, patch);
+  const task = taskStore.updateTask(taskId, patch);
+  if (!task) return null;
+
+  if (isCompletedTask(task)) {
+    if (task.queueTracked) {
+      taskQueue.remove(task.taskId);
+    }
+  }
+
+  void persistTaskRecord(task);
+
+  return task;
 }
+
+function drainTaskQueue() {
+  const workers = getWorkerClients(wss);
+  if (workers.length === 0) return 0;
+
+  let dispatched = 0;
+
+  while (true) {
+    const task = taskQueue.dequeueReadyTask();
+    if (!task) break;
+
+    const worker = workers[dispatched % workers.length];
+    if (!worker) {
+      taskQueue.enqueue(task.taskId);
+      break;
+    }
+
+    dispatchTaskToWorker(task, worker, task.retryCount);
+    dispatched += 1;
+  }
+
+  return dispatched;
+}
+
+function requeueTasksForWorker(workerClientId) {
+  if (!workerClientId) return 0;
+
+  let requeued = 0;
+
+  for (const task of taskStore.listTasks()) {
+    if (task.assignedWorkerClientId !== workerClientId) continue;
+    if (isCompletedTask(task)) continue;
+
+    const nextTask = updateTask(task.taskId, {
+      status: TASK_STATUS.QUEUED,
+      assignedWorkerClientId: null,
+      queueTracked: true,
+      startedAt: null,
+      endedAt: null,
+      error: null,
+      errorCode: null,
+    });
+    if (!nextTask) continue;
+
+    taskQueue.enqueue(task.taskId);
+    requeued += 1;
+  }
+
+  if (requeued > 0) {
+    logger.warn("task.requeued_after_worker_disconnect", {
+      workerClientId,
+      requeued,
+    });
+  }
+
+  return requeued;
+}
+
+function attachTaskQueueReadyHandler() {
+  taskQueue.setReadyHandler(() => {
+    drainTaskQueue();
+  });
+}
+
+attachTaskQueueReadyHandler();
 
 function cleanupExpiredTasks() {
   const timedOutTasks = taskStore.timeoutStuckTasks();
@@ -651,79 +523,30 @@ function cleanupExpiredTasks() {
   }
 }
 
-function toTimeMs(value) {
-  return value ? new Date(value).getTime() : 0;
-}
+async function listTaskHistory(options = {}) {
+  if (typeof productStore.listTaskRecords !== "function") {
+    return taskStore
+      .listTasks(options)
+      .map((task) => buildTaskResponse(task, { defaultMaxRetries: config.taskMaxRetries }));
+  }
 
-function buildTaskResponse(task) {
-  const createdAtMs = toTimeMs(task.createdAt);
-  const startedAtMs = toTimeMs(task.startedAt);
-  const endedAtMs = toTimeMs(task.endedAt);
-  const updatedAtMs = toTimeMs(task.updatedAt);
-  const finishMs = endedAtMs || updatedAtMs;
-  const durationMs =
-    createdAtMs > 0 && finishMs >= createdAtMs ? finishMs - createdAtMs : null;
-  const queueMs =
-    createdAtMs > 0 && startedAtMs >= createdAtMs ? startedAtMs - createdAtMs : null;
-  const processingMs =
-    startedAtMs > 0 && finishMs >= startedAtMs ? finishMs - startedAtMs : null;
-
-  return {
-    taskId: task.taskId,
-    itemId: /^\d+$/.test(String(task.requestUrl || "")) ? String(task.requestUrl) : null,
-    status: task.status,
-    requestUrl: task.requestUrl,
-    affiliateUrl: task.affiliateUrl,
-    result: task.result,
-    raw: task.raw,
-    error: task.error,
-    errorCode: task.errorCode,
-    parseError: task.parseError,
-    startedAt: task.startedAt,
-    endedAt: task.endedAt,
-    durationMs,
-    queueMs,
-    processingMs,
-    createdAt: task.createdAt,
-    updatedAt: task.updatedAt,
-  };
-}
-
-function sendHttpJson(res, statusCode, payload) {
-  res.writeHead(statusCode, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store",
+  const statuses = options.status ? [options.status] : [];
+  const rows = await productStore.listTaskRecords({
+    statuses,
+    limit: 500,
   });
-  res.end(JSON.stringify(payload));
+  return rows.map((task) => buildTaskResponse(task, { defaultMaxRetries: config.taskMaxRetries }));
 }
 
-function readJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
+async function getTaskById(taskId) {
+  const current = taskStore.getTask(taskId);
+  if (current) return current;
 
-    req.on("data", (chunk) => {
-      body += chunk;
-      if (body.length > 1_000_000) {
-        reject(new Error("Request body qua lon"));
-        req.destroy();
-      }
-    });
+  if (typeof productStore.getTaskRecord !== "function") {
+    return null;
+  }
 
-    req.on("end", () => {
-      if (!body) {
-        resolve({});
-        return;
-      }
-
-      try {
-        resolve(JSON.parse(body));
-      } catch {
-        reject(new Error("Request body khong phai JSON hop le"));
-      }
-    });
-
-    req.on("error", reject);
-  });
+  return productStore.getTaskRecord(taskId);
 }
 
 function enqueueTaskForWorker(payload, requester) {
@@ -783,39 +606,163 @@ function enqueueTaskForWorker(payload, requester) {
     };
   }
 
-  const workers = getWorkerClients(wss);
-  if (workers.length === 0) {
-    return {
-      ok: false,
-      statusCode: 503,
-      error: buildErrorMessage("Khong co Playwright worker dang ket noi", { taskId: payload.taskId }),
-    };
-  }
-
-  const worker = workers[0];
   const task = registerTask(payload, requester);
+  task.queueTracked = true;
+  taskQueue.enqueue(task.taskId);
+  const workers = getWorkerClients(wss);
+  const worker = workers[0] || null;
 
   logger.info("task.queued", {
     taskId: task.taskId,
     requestUrl: task.requestUrl,
-    workerClientId: worker.meta?.clientId,
+    workerClientId: worker?.meta?.clientId ?? null,
     trigger: requester ? "ws" : "http",
   });
 
-  sendJson(worker, payload);
+  drainTaskQueue();
 
   if (requester) {
     sendTaskUpdate(task.taskId, {
       type: "QUEUED",
       status: TASK_STATUS.QUEUED,
-      message: `Task da duoc dua sang worker #${worker.meta?.clientId}`,
+      message: worker
+        ? `Task da duoc dua sang worker #${worker.meta?.clientId}`
+        : "Task da vao queue, dang cho worker ket noi",
     });
   }
 
   return {
     ok: true,
     task,
-    workerClientId: worker.meta?.clientId,
+    workerClientId: worker?.meta?.clientId ?? null,
+  };
+}
+
+function dispatchTaskToWorker(task, worker, retryCount) {
+  if (!task || !worker) return;
+
+  updateTask(task.taskId, {
+    assignedWorkerClientId: worker.meta?.clientId ?? null,
+    queueTracked: true,
+    nextAttemptAt: null,
+  });
+
+  sendJson(worker, {
+    ...(task.requestPayload || {}),
+    taskId: task.taskId,
+    retryCount: Number(retryCount ?? task.retryCount ?? 0),
+    maxRetries: Number(task.maxRetries ?? config.taskMaxRetries),
+  });
+}
+
+function retryTaskWithWorker(task, reason) {
+  if (!task) return false;
+  if (Number(task.retryCount || 0) >= Number(task.maxRetries || config.taskMaxRetries)) {
+    return false;
+  }
+
+  const nextRetryCount = Number(task.retryCount || 0) + 1;
+  const previousWorkerClientId = task.assignedWorkerClientId ?? null;
+
+  updateTask(task.taskId, {
+    status: TASK_STATUS.QUEUED,
+    assignedWorkerClientId: null,
+    queueTracked: true,
+    retryCount: nextRetryCount,
+    nextAttemptAt: new Date(Date.now() + config.taskRetryDelayMs).toISOString(),
+    error: null,
+    errorCode: null,
+  });
+
+  taskQueue.schedule(task.taskId, config.taskRetryDelayMs);
+
+  logger.warn("task.retry_scheduled", {
+    taskId: task.taskId,
+    requestUrl: task.requestUrl,
+    retryCount: nextRetryCount,
+    workerClientId: previousWorkerClientId,
+    reason,
+  });
+
+  return true;
+}
+
+async function restoreActiveTasksFromStore() {
+  if (typeof productStore.listTaskRecords !== "function") return 0;
+
+  let restored = 0;
+  let skippedQueued = 0;
+  let markedStale = 0;
+
+  try {
+    const entries = await productStore.listTaskRecords({
+      statuses: [TASK_STATUS.QUEUED, TASK_STATUS.RUNNING],
+      limit: 1000,
+    });
+
+    for (const entry of entries) {
+      if (!entry?.taskId || taskStore.hasTask(entry.taskId)) continue;
+
+      if (taskQueue.driver === "bullmq" && entry.status === TASK_STATUS.QUEUED) {
+        const hasPersistedJob =
+          typeof taskQueue.hasPersistedJob === "function"
+            ? await taskQueue.hasPersistedJob(entry.taskId)
+            : false;
+
+        if (hasPersistedJob) {
+          skippedQueued += 1;
+          continue;
+        }
+
+        await markTaskHistoryStale(
+          entry,
+          "TASK_RESTORE_STALE",
+          "Task queued cu khong con ton tai trong BullMQ",
+        );
+        markedStale += 1;
+        continue;
+      }
+
+      taskStore.hydrateTask(entry);
+      restored += 1;
+    }
+
+    if (restored > 0 || skippedQueued > 0 || markedStale > 0) {
+      logger.info("task.store_restored", {
+        restored,
+        skippedQueued,
+        markedStale,
+        driver: productStore.driver,
+      });
+    }
+
+    return restored;
+  } catch (error) {
+    logger.warn("task.store_restore_failed", {
+      driver: productStore.driver,
+      message: error.message,
+    });
+    return 0;
+  }
+}
+
+async function readQueueSnapshot() {
+  const stats = typeof taskQueue.stats === "function"
+    ? await taskQueue.stats()
+    : {
+        driver: taskQueue.driver,
+        waiting: taskQueue.size(),
+        delayed: taskQueue.delayedSize(),
+        readyBuffer: taskQueue.size(),
+      };
+
+  return {
+    driver: stats.driver || taskQueue.driver,
+    waiting: Number(stats.waiting || 0),
+    delayed: Number(stats.delayed || 0),
+    readyBuffer: Number(stats.readyBuffer || 0),
+    queueName: stats.queueName || null,
+    queuePrefix: stats.queuePrefix || null,
   };
 }
 
@@ -826,29 +773,197 @@ const httpServer = http.createServer(async (req, res) => {
   const requestUrl = new URL(req.url || "/", `http://${req.headers.host || `localhost:${config.port}`}`);
 
   if (method === "GET" && requestUrl.pathname === "/health") {
+    const queueSnapshot = await readQueueSnapshot();
     sendHttpJson(res, 200, {
-      ok: true,
       port: config.port,
       workerClients: getWorkerClients(wss).length,
       taskCount: taskStore.size(),
+      pendingTaskCount: queueSnapshot.waiting + queueSnapshot.delayed,
+      queueDriver: queueSnapshot.driver,
+      queueSize: queueSnapshot.waiting,
+      delayedQueueSize: queueSnapshot.delayed,
       productStoreDriver: productStore.driver,
       productCount: await readProductStoreSize(),
+      meta: {
+        endpoint: "/health",
+      },
     });
     return;
   }
 
   if (method === "GET" && requestUrl.pathname === "/session") {
+    const profileSummary = summarizeProfiles(loadProfiles());
+    const queueSnapshot = await readQueueSnapshot();
     sendHttpJson(res, 200, {
-      ok: true,
       chromeCdpUrl: config.browserCdpUrl || null,
       workerClients: getWorkerClients(wss).length,
       taskCount: taskStore.size(),
+      pendingTaskCount: queueSnapshot.waiting + queueSnapshot.delayed,
+      queueDriver: queueSnapshot.driver,
+      queueSize: queueSnapshot.waiting,
+      delayedQueueSize: queueSnapshot.delayed,
       cacheSize: productCache.size,
       productCount: await readProductStoreSize(),
       productStoreDriver: productStore.driver,
       productCacheTtlMs: config.productCacheTtlMs,
+      profiles: profileSummary,
       session: latestWorkerSession,
+      meta: {
+        endpoint: "/session",
+      },
     });
+    return;
+  }
+
+  if (method === "GET" && requestUrl.pathname === "/queue") {
+    const queuedTasks = taskStore
+      .listTasks()
+      .filter((task) => task.status === TASK_STATUS.QUEUED || task.status === TASK_STATUS.RUNNING)
+      .map(buildTaskResponse);
+    const queueStats = await readQueueSnapshot();
+
+    sendHttpJson(res, 200, {
+      queue: queueStats,
+      tasks: queuedTasks,
+      total: queuedTasks.length,
+      meta: {
+        endpoint: "/queue",
+      },
+    });
+    return;
+  }
+
+  if (method === "GET" && requestUrl.pathname === "/profiles") {
+    sendHttpJson(res, 200, {
+      ...summarizeProfiles(loadProfiles()),
+      meta: {
+        endpoint: "/profiles",
+      },
+    });
+    return;
+  }
+
+  if (method === "POST" && requestUrl.pathname.startsWith("/profiles/") && requestUrl.pathname.endsWith("/recover")) {
+    const profileId = getProfileIdFromPath(requestUrl.pathname, "/recover");
+    const registry = loadProfiles();
+    const target = findProfileByNameOrId(registry, profileId);
+    if (!target) {
+      sendHttpJson(res, 404, buildErrorMessage("Khong tim thay profile", { profileId }));
+      return;
+    }
+
+    const result = recoverProfile(registry, target.id);
+    sendHttpJson(res, 200, {
+      profile: result.profile,
+      profiles: summarizeProfiles(result.registry),
+      meta: {
+        action: "recover",
+        profileId: target.id,
+      },
+    });
+    return;
+  }
+
+  if (method === "POST" && requestUrl.pathname.startsWith("/profiles/") && requestUrl.pathname.endsWith("/disable")) {
+    const profileId = getProfileIdFromPath(requestUrl.pathname, "/disable");
+    const registry = loadProfiles();
+    const target = findProfileByNameOrId(registry, profileId);
+    if (!target) {
+      sendHttpJson(res, 404, buildErrorMessage("Khong tim thay profile", { profileId }));
+      return;
+    }
+
+    const result = disableProfile(registry, target.id);
+    sendHttpJson(res, 200, {
+      profile: result.profile,
+      profiles: summarizeProfiles(result.registry),
+      meta: {
+        action: "disable",
+        profileId: target.id,
+      },
+    });
+    return;
+  }
+
+  if (method === "POST" && requestUrl.pathname.startsWith("/profiles/") && requestUrl.pathname.endsWith("/enable")) {
+    const profileId = getProfileIdFromPath(requestUrl.pathname, "/enable");
+    const registry = loadProfiles();
+    const target = findProfileByNameOrId(registry, profileId);
+    if (!target) {
+      sendHttpJson(res, 404, buildErrorMessage("Khong tim thay profile", { profileId }));
+      return;
+    }
+
+    const result = updateProfileState(registry, target.id, {
+      status: "ready",
+      blockedUntil: null,
+      lastRecoveredAt: new Date().toISOString(),
+    });
+    sendHttpJson(res, 200, {
+      profile: result.profile,
+      profiles: summarizeProfiles(result.registry),
+      meta: {
+        action: "enable",
+        profileId: target.id,
+      },
+    });
+    return;
+  }
+
+  if (method === "POST" && requestUrl.pathname.startsWith("/profiles/") && requestUrl.pathname.endsWith("/default")) {
+    const profileId = getProfileIdFromPath(requestUrl.pathname, "/default");
+    const registry = loadProfiles();
+    const target = findProfileByNameOrId(registry, profileId);
+    if (!target) {
+      sendHttpJson(res, 404, buildErrorMessage("Khong tim thay profile", { profileId }));
+      return;
+    }
+
+    const result = setDefaultProfile(registry, target.id);
+    sendHttpJson(res, 200, {
+      profile: result.profile,
+      profiles: summarizeProfiles(result.registry),
+      meta: {
+        action: "set-default",
+        profileId: target.id,
+      },
+    });
+    return;
+  }
+
+  if (method === "POST" && requestUrl.pathname.startsWith("/profiles/") && requestUrl.pathname.endsWith("/cooldown")) {
+    const profileId = getProfileIdFromPath(requestUrl.pathname, "/cooldown");
+    const registry = loadProfiles();
+    const target = findProfileByNameOrId(registry, profileId);
+    if (!target) {
+      sendHttpJson(res, 404, buildErrorMessage("Khong tim thay profile", { profileId }));
+      return;
+    }
+
+    try {
+      const body = await readJsonBody(req);
+      const durationMs = Math.max(
+        1000,
+        Number(body.durationMs || config.profileCooldownMs),
+      );
+      const result = updateProfileState(registry, target.id, {
+        status: "cooldown",
+        blockedUntil: new Date(Date.now() + durationMs).toISOString(),
+        lastErrorCode: "MANUAL_COOLDOWN",
+        lastErrorMessage: "Dat cooldown thu cong",
+      });
+      sendHttpJson(res, 200, {
+        profile: result.profile,
+        profiles: summarizeProfiles(result.registry),
+        meta: {
+          action: "cooldown",
+          profileId: target.id,
+          durationMs,
+        },
+      });
+    } catch (error) {
+      sendHttpJson(res, 400, buildErrorMessage(error.message, { profileId }));
+    }
     return;
   }
 
@@ -874,8 +989,14 @@ const httpServer = http.createServer(async (req, res) => {
       mode,
       source: productStore.driver,
       products: payload.items.map((record) =>
-        buildProductPayload(buildStoreProductEntry(record), mode),
+        buildProductPayload(buildStoreProductEntry(record), mode, {
+          productCacheTtlMs: config.productCacheTtlMs,
+        }),
       ),
+      meta: {
+        endpoint: "/products",
+        q,
+      },
     });
     return;
   }
@@ -902,6 +1023,10 @@ const httpServer = http.createServer(async (req, res) => {
       source: productStore.driver,
       total: history.length,
       history,
+      meta: {
+        endpoint: "/products/:itemId/history",
+        limit,
+      },
     });
     return;
   }
@@ -941,11 +1066,11 @@ const httpServer = http.createServer(async (req, res) => {
       const results = await Promise.all(
         itemIds.map(async (itemId) => {
           const result = await fetchProductByItemId(itemId, mode, { refresh });
-          return {
+          return normalizeHttpPayload(result.statusCode, {
             itemId,
             statusCode: result.statusCode,
             ...result.payload,
-          };
+          });
         }),
       );
 
@@ -956,6 +1081,10 @@ const httpServer = http.createServer(async (req, res) => {
         total: results.length,
         invalidItems,
         results,
+        meta: {
+          endpoint: "/products/batch",
+          requested: rawItems.length,
+        },
       });
     } catch (error) {
       logger.warn("http.invalid_request", {
@@ -1014,7 +1143,11 @@ const httpServer = http.createServer(async (req, res) => {
           ? "Task tra ve tu cache"
           : `Task da duoc dua sang worker #${result.workerClientId}`,
         cacheHit: Boolean(result.fromCache),
-        task: buildTaskResponse(result.task),
+        task: buildTaskResponse(result.task, { defaultMaxRetries: config.taskMaxRetries }),
+        meta: {
+          endpoint: "/scrape",
+          workerClientId: result.workerClientId || null,
+        },
       });
     } catch (error) {
       logger.warn("http.invalid_request", {
@@ -1030,26 +1163,34 @@ const httpServer = http.createServer(async (req, res) => {
 
   if (method === "GET" && requestUrl.pathname === "/tasks") {
     const status = requestUrl.searchParams.get("status") || undefined;
-    const tasks = taskStore.listTasks({ status }).map(buildTaskResponse);
+    const tasks = await listTaskHistory({ status });
 
     sendHttpJson(res, 200, {
       tasks,
       total: tasks.length,
       filters: { status: status || null },
+      meta: {
+        endpoint: "/tasks",
+      },
     });
     return;
   }
 
   if (method === "GET" && requestUrl.pathname.startsWith("/tasks/")) {
     const taskId = decodeURIComponent(requestUrl.pathname.slice("/tasks/".length));
-    const task = taskStore.getTask(taskId);
+    const task = await getTaskById(taskId);
 
     if (!task) {
       sendHttpJson(res, 404, buildErrorMessage("Khong tim thay task", { taskId }));
       return;
     }
 
-    sendHttpJson(res, 200, { task: buildTaskResponse(task) });
+    sendHttpJson(res, 200, {
+      task: buildTaskResponse(task, { defaultMaxRetries: config.taskMaxRetries }),
+      meta: {
+        endpoint: "/tasks/:taskId",
+      },
+    });
     return;
   }
 
@@ -1067,7 +1208,7 @@ const httpServer = http.createServer(async (req, res) => {
     if (isCompletedTask(existingTask)) {
       sendHttpJson(res, 409, buildErrorMessage("Task da ket thuc, khong can cancel", {
         taskId,
-        task: buildTaskResponse(existingTask),
+        task: buildTaskResponse(existingTask, { defaultMaxRetries: config.taskMaxRetries }),
       }));
       return;
     }
@@ -1091,13 +1232,19 @@ const httpServer = http.createServer(async (req, res) => {
     });
     clearRequesterSocket(taskId);
 
-    sendHttpJson(res, 200, { task: buildTaskResponse(task) });
+    sendHttpJson(res, 200, {
+      task: buildTaskResponse(task, { defaultMaxRetries: config.taskMaxRetries }),
+      meta: {
+        endpoint: "/tasks/:taskId/cancel",
+      },
+    });
     return;
   }
 
   if (method === "DELETE" && requestUrl.pathname.startsWith("/tasks/")) {
     const taskId = decodeURIComponent(requestUrl.pathname.slice("/tasks/".length));
     const task = taskStore.removeTask(taskId);
+    taskQueue.remove(taskId);
     clearRequesterSocket(taskId);
 
     if (!task) {
@@ -1107,7 +1254,11 @@ const httpServer = http.createServer(async (req, res) => {
 
     sendHttpJson(res, 200, {
       removed: true,
-      task: buildTaskResponse(task),
+      task: buildTaskResponse(task, { defaultMaxRetries: config.taskMaxRetries }),
+      meta: {
+        endpoint: "/tasks/:taskId",
+        action: "delete",
+      },
     });
     return;
   }
@@ -1189,6 +1340,7 @@ wss.on("connection", (ws) => {
         clientId: ws.meta.clientId,
       });
       sendJson(ws, { type: "REGISTERED", role: "worker" });
+      drainTaskQueue();
       return;
     }
 
@@ -1305,11 +1457,12 @@ wss.on("connection", (ws) => {
         });
       } catch (err) {
         const task = updateTask(payload.taskId, {
-          status: TASK_STATUS.SUCCESS,
+          status: TASK_STATUS.ERROR,
           affiliateUrl: payload.url,
           result: null,
           raw: payload.data,
-          error: null,
+          error: err.message,
+          errorCode: "PARSE_ERROR",
           parseError: err.message,
         });
 
@@ -1321,10 +1474,11 @@ wss.on("connection", (ws) => {
         });
 
         sendTaskUpdate(payload.taskId, {
-          type: "SUCCESS",
-          status: TASK_STATUS.SUCCESS,
+          type: "ERROR",
+          status: TASK_STATUS.ERROR,
           affiliateUrl: payload.url,
-          result: null,
+          error: err.message,
+          errorCode: "PARSE_ERROR",
           parseError: err.message,
         });
       } finally {
@@ -1350,6 +1504,14 @@ wss.on("connection", (ws) => {
         error: payload.message || "Worker tra ve loi khong ro nguyen nhan",
         errorCode: payload.code || "WORKER_ERROR",
       });
+
+      if (
+        task &&
+        RETRYABLE_ERROR_CODES.has(payload.code || "WORKER_ERROR") &&
+        retryTaskWithWorker(task, payload.message || payload.code || "WORKER_ERROR")
+      ) {
+        return;
+      }
 
       logger.warn("task.failed", {
         taskId: payload.taskId,
@@ -1387,6 +1549,10 @@ httpServer.on("error", (err) => {
 
 async function startServer() {
   await productStore.init();
+  taskQueue = await createTaskQueueWithFallback({ taskStore, logger, config });
+  attachTaskQueueReadyHandler();
+  await restoreActiveTasksFromStore();
+  taskQueue.restore(taskStore.listTasks());
   logger.info("product_store.ready", {
     driver: productStore.driver,
     productCount: await readProductStoreSize(),

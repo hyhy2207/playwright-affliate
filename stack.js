@@ -7,9 +7,34 @@ const { chromium } = require("playwright");
 const readline = require("readline");
 
 const { config } = require("./config");
+const { ensureChromeCdpReady: ensureChromeCdpReadyExternal } = require("./chrome-launcher");
+const { warmUpShopeeSession } = require("./browser-context");
+const {
+  buildProfileEnv,
+  findDefaultProfile,
+  findProfileByNameOrId,
+  formatProfileLine,
+  getNextProfile,
+  loadProfiles,
+  markProfileFailure,
+  markProfileHealthy,
+  markProfileSelected,
+  summarizeProfiles,
+  touchProfileTask,
+} = require("./profile-manager");
 
 const children = new Set();
 let shuttingDown = false;
+let workerMonitorTimer = null;
+let currentWorkerProfile = null;
+let switchInFlight = false;
+let lastAutoSwitchAt = 0;
+const AUTO_SWITCH_ERROR_CODES = new Set([
+  "CAPTCHA_REQUIRED",
+  "LOGIN_REQUIRED",
+  "LOADING_ISSUE",
+  "CDP_DISCONNECTED",
+]);
 
 function prefixStream(stream, prefix) {
   const rl = readline.createInterface({ input: stream });
@@ -19,10 +44,12 @@ function prefixStream(stream, prefix) {
   return rl;
 }
 
-function spawnService(label, scriptName) {
+function spawnService(label, scriptName, options = {}) {
+  const env = options.envFactory ? options.envFactory() : { ...process.env, ...(options.env || {}) };
   const child = spawn(process.execPath, [scriptName], {
     cwd: __dirname,
     stdio: ["ignore", "pipe", "pipe"],
+    env,
   });
 
   children.add(child);
@@ -38,6 +65,13 @@ function spawnService(label, scriptName) {
       process.stdout.write(
         `[${label}] exited code=${code ?? "null"} signal=${signal ?? "null"}\n`
       );
+      if (options.restart !== false) {
+        setTimeout(() => {
+          if (!shuttingDown) {
+            spawnService(label, scriptName, options);
+          }
+        }, config.serviceRestartDelayMs).unref();
+      }
     }
   });
 
@@ -73,15 +107,26 @@ function requestHealth() {
   });
 }
 
-function requestJson(urlString) {
-  const url = new URL(urlString);
+async function ensureChromeCdpReady(timeoutMs) {
+  return ensureChromeCdpReadyInternal(timeoutMs);
+}
 
+async function ensureChromeCdpReadyInternal(timeoutMs) {
+  await ensureChromeCdpReadyExternal({
+    browserCdpUrl: config.browserCdpUrl,
+    browserProfileDir: config.browserProfileDir,
+    cwd: __dirname,
+    timeoutMs,
+  });
+}
+
+function requestJson(pathname) {
   return new Promise((resolve, reject) => {
     const req = http.request(
       {
-        hostname: url.hostname,
-        port: url.port,
-        path: `${url.pathname}${url.search}`,
+        hostname: "127.0.0.1",
+        port: config.port,
+        path: pathname,
         method: "GET",
       },
       (res) => {
@@ -102,57 +147,6 @@ function requestJson(urlString) {
     req.on("error", reject);
     req.end();
   });
-}
-
-function spawnChromeCdp() {
-  const userDataDir =
-    config.browserProfileDir && config.browserProfileDir !== ".browser-profile"
-      ? config.browserProfileDir
-      : "/tmp/shopee-cdp-profile";
-
-  const chromeArgs = [
-    "--remote-debugging-port=9222",
-    `--user-data-dir=${userDataDir}`,
-  ];
-
-  const child = spawn("google-chrome", chromeArgs, {
-    cwd: __dirname,
-    detached: true,
-    stdio: "ignore",
-  });
-
-  child.unref();
-  process.stdout.write(
-    `Chrome CDP chua mo. Dang thu mo tu dong voi profile ${userDataDir}\n`
-  );
-}
-
-async function ensureChromeCdpReady(timeoutMs) {
-  if (!config.browserCdpUrl) return;
-
-  const startedAt = Date.now();
-  let hasSpawnedChrome = false;
-
-  for (;;) {
-    try {
-      await requestJson(new URL("/json/version", config.browserCdpUrl).toString());
-      process.stdout.write(`Chrome CDP da san sang tai ${config.browserCdpUrl}\n`);
-      return;
-    } catch (error) {
-      if (!hasSpawnedChrome) {
-        hasSpawnedChrome = true;
-        spawnChromeCdp();
-      }
-    }
-
-    if (Date.now() - startedAt >= timeoutMs) {
-      throw new Error(
-        `Khong ket noi duoc Chrome CDP tai ${config.browserCdpUrl}. Hay mo Chrome thu cong truoc.`
-      );
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
 }
 
 function isAffiliateRelatedUrl(url) {
@@ -192,6 +186,22 @@ async function openAffiliatePageInChrome() {
     }
 
     const page = await context.newPage();
+    const warmup = await warmUpShopeeSession(page, {
+      targetUrl: "https://shopee.vn",
+      waitMs: config.profileWarmupDelayMs,
+    }).catch((error) => ({
+      warmed: false,
+      skipped: false,
+      error,
+    }));
+    if (warmup?.blockingIssue) {
+      process.stdout.write(
+        `Warm-up Shopee gap block/captcha (${warmup.blockingIssue.currentUrl || "unknown"}). Hay xu ly bang tay truoc khi crawl affiliate.\n`
+      );
+      await page.bringToFront().catch(() => {});
+      return;
+    }
+
     const targetUrl = `${config.affiliateBaseUrl.replace(/\/$/, "")}/`;
     await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
     await page.bringToFront().catch(() => {});
@@ -199,6 +209,145 @@ async function openAffiliatePageInChrome() {
   } finally {
     await browser.close().catch(() => {});
   }
+}
+
+async function openAffiliatePageForProfile(profile) {
+  const env = buildProfileEnv(profile);
+  if (!env.BROWSER_CDP_URL) return;
+
+  await ensureChromeCdpReadyExternal({
+    browserCdpUrl: env.BROWSER_CDP_URL,
+    browserProfileDir: env.BROWSER_PROFILE_DIR,
+    cwd: __dirname,
+    timeoutMs: config.workerWaitTimeoutMs,
+    logPrefix: `[profile:${profile.name}] `,
+  });
+
+  const browser = await chromium.connectOverCDP(env.BROWSER_CDP_URL);
+  try {
+    const context = browser.contexts()[0];
+    if (!context) return;
+
+    const existingPage = context.pages().find((page) => isAffiliateRelatedUrl(page.url()));
+    if (existingPage) {
+      await existingPage.bringToFront().catch(() => {});
+      return;
+    }
+
+    const page = await context.newPage();
+    const warmup = await warmUpShopeeSession(page, {
+      targetUrl: "https://shopee.vn",
+      waitMs: config.profileWarmupDelayMs,
+    }).catch((error) => ({
+      warmed: false,
+      skipped: false,
+      error,
+    }));
+    if (warmup?.blockingIssue) {
+      process.stdout.write(
+        `[profile:${profile.name}] Warm-up Shopee gap block/captcha (${warmup.blockingIssue.currentUrl || "unknown"}).\n`
+      );
+      await page.bringToFront().catch(() => {});
+      return;
+    }
+
+    const targetUrl = `${config.affiliateBaseUrl.replace(/\/$/, "")}/`;
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    await page.bringToFront().catch(() => {});
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+function getWorkerChild() {
+  for (const child of children) {
+    if (child.spawnargs?.includes("playwright-worker.js")) {
+      return child;
+    }
+  }
+  return null;
+}
+
+async function fetchWorkerSession() {
+  const payload = await requestJson("/session");
+  return payload?.session || null;
+}
+
+async function rotateWorkerProfile(reason, session) {
+  if (switchInFlight || shuttingDown) return;
+  if (Date.now() - lastAutoSwitchAt < config.profileSwitchDebounceMs) return;
+  switchInFlight = true;
+
+  try {
+    const registry = loadProfiles();
+    const currentRef =
+      session?.profileName || currentWorkerProfile?.name || process.env.PROFILE_NAME || registry.defaultProfileId;
+    const failureState = markProfileFailure(
+      registry,
+      currentRef,
+      session?.errorCode || "PROFILE_BLOCKED",
+      reason,
+    );
+    const nextProfile = getNextProfile(failureState.registry, currentRef, []);
+
+    if (!nextProfile) {
+      process.stdout.write(
+        `[switch] Khong con profile khac de doi. Profile hien tai: ${currentRef}. Loi: ${reason}\n`
+      );
+      return;
+    }
+
+    currentWorkerProfile = markProfileSelected(failureState.registry, nextProfile);
+    lastAutoSwitchAt = Date.now();
+    process.stdout.write(
+      `[switch] Shopee phat hien profile ${currentRef}. Dang doi sang ${formatProfileLine(currentWorkerProfile, true)}\n`
+    );
+    await openAffiliatePageForProfile(currentWorkerProfile).catch((error) => {
+      process.stdout.write(`[switch] Khong mo san duoc tab affiliate cho ${currentWorkerProfile.name}: ${error.message}\n`);
+    });
+
+    const workerChild = getWorkerChild();
+    if (workerChild) {
+      workerChild.kill("SIGTERM");
+    } else {
+      spawnService("worker", "playwright-worker.js", {
+        envFactory: () => ({
+          ...process.env,
+          ...buildProfileEnv(currentWorkerProfile),
+        }),
+      });
+    }
+  } finally {
+    switchInFlight = false;
+  }
+}
+
+function startWorkerSessionMonitor() {
+  if (workerMonitorTimer) return;
+
+  workerMonitorTimer = setInterval(async () => {
+    try {
+      const session = await fetchWorkerSession();
+      if (!session) return;
+      if (!session.profileName) return;
+      if (session.workerReady) {
+        const state = markProfileHealthy(loadProfiles(), session.profileName);
+        touchProfileTask(state.registry, session.profileName);
+        return;
+      }
+      if (!AUTO_SWITCH_ERROR_CODES.has(session.errorCode)) return;
+
+      await rotateWorkerProfile(session.message || session.errorCode, session);
+    } catch {}
+  }, 3000);
+  workerMonitorTimer.unref();
+}
+
+function printProfileSummary() {
+  const summary = summarizeProfiles(loadProfiles());
+  process.stdout.write(
+    `[profiles] total=${summary.total} ready=${summary.ready} cooldown=${summary.cooldown} disabled=${summary.disabled} default=${summary.defaultProfileId || "-"}\n`
+  );
 }
 
 async function waitForWorkerReady(timeoutMs) {
@@ -229,6 +378,10 @@ function shutdown(exitCode = 0) {
   for (const child of children) {
     child.kill("SIGTERM");
   }
+  if (workerMonitorTimer) {
+    clearInterval(workerMonitorTimer);
+    workerMonitorTimer = null;
+  }
 
   setTimeout(() => {
     for (const child of children) {
@@ -242,11 +395,22 @@ async function main() {
   process.stdout.write(
     `Starting stack on port ${config.port} from ${path.basename(__dirname)}\n`
   );
+  printProfileSummary();
 
   await ensureChromeCdpReady(config.workerWaitTimeoutMs);
   await openAffiliatePageInChrome();
   spawnService("server", "server.js");
-  spawnService("worker", "playwright-worker.js");
+  const registry = loadProfiles();
+  currentWorkerProfile =
+    findProfileByNameOrId(registry, process.env.PROFILE_NAME) ||
+    findDefaultProfile(registry);
+  spawnService("worker", "playwright-worker.js", {
+    envFactory: () => ({
+      ...process.env,
+      ...(currentWorkerProfile ? buildProfileEnv(currentWorkerProfile) : {}),
+    }),
+  });
+  startWorkerSessionMonitor();
   try {
     await waitForWorkerReady(config.workerWaitTimeoutMs);
     process.stdout.write(
