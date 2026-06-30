@@ -3,8 +3,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
+process.env.PRODUCT_STORE_DRIVER = "none";
+
 const {
-  isUndefinedTableError,
   normalizeTaskHistoryLimit,
   shouldPruneTaskHistoryRecord,
 } = require("../product-store");
@@ -40,28 +41,21 @@ test("shouldPruneTaskHistoryRecord only prunes completed item tasks", () => {
   );
 });
 
-test("isUndefinedTableError detects missing task_history relation", () => {
-  assert.equal(
-    isUndefinedTableError(
-      { code: "42P01", message: 'relation "task_history" does not exist' },
-      "task_history",
-    ),
-    true,
-  );
 
-  assert.equal(
-    isUndefinedTableError(
-      { code: "42P01", message: 'relation "products" does not exist' },
-      "task_history",
-    ),
-    false,
-  );
+test("createProductStore supports none driver", async () => {
+  process.env.PRODUCT_STORE_DRIVER = "none";
+  delete require.cache[require.resolve("../config")];
+  delete require.cache[require.resolve("../product-store")];
 
-  assert.equal(
-    isUndefinedTableError(
-      { code: "23505", message: "duplicate key value violates unique constraint" },
-      "task_history",
-    ),
-    false,
-  );
+  const { createProductStore } = require("../product-store");
+  const store = createProductStore();
+
+  assert.equal(store.driver, "none");
+  assert.equal(await store.getProduct("123"), null);
+  assert.deepEqual(await store.listProducts(), {
+    items: [],
+    total: 0,
+    limit: 50,
+    offset: 0,
+  });
 });

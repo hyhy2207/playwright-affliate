@@ -8,7 +8,10 @@ const readline = require("readline");
 
 const { config } = require("./config");
 const { ensureChromeCdpReady: ensureChromeCdpReadyExternal } = require("./chrome-launcher");
-const { warmUpShopeeSession } = require("./browser-context");
+const {
+  disconnectBrowser,
+  warmUpShopeeSession,
+} = require("./browser-context");
 const {
   buildProfileEnv,
   findDefaultProfile,
@@ -149,6 +152,24 @@ function requestJson(pathname) {
   });
 }
 
+function promptToContinue(message) {
+  if (!process.stdin.isTTY) {
+    process.stdout.write(`${message}\n`);
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    rl.question(`${message}\n`, () => {
+      rl.close();
+      resolve();
+    });
+  });
+}
+
 function isAffiliateRelatedUrl(url) {
   const value = String(url || "").toLowerCase();
   return (
@@ -158,8 +179,14 @@ function isAffiliateRelatedUrl(url) {
   );
 }
 
-async function openAffiliatePageInChrome() {
-  if (!config.browserCdpUrl) return;
+function isActualAffiliateUrl(url) {
+  return String(url || "").toLowerCase().includes("affiliate.shopee.vn");
+}
+
+async function openAffiliatePageInChrome(options = {}) {
+  if (!config.browserCdpUrl) {
+    return { status: "skipped", reason: "no_cdp" };
+  }
 
   const browser = await chromium.connectOverCDP(config.browserCdpUrl);
 
@@ -173,41 +200,47 @@ async function openAffiliatePageInChrome() {
       );
     }
 
-    const existingPage = context
-      .pages()
-      .find((page) => isAffiliateRelatedUrl(page.url()));
+    const existingPage = context.pages().find((page) => isActualAffiliateUrl(page.url()));
 
     if (existingPage) {
       await existingPage.bringToFront().catch(() => {});
       process.stdout.write(
         `Da tim thay tab affiliate san: ${existingPage.url()}\n`
       );
-      return;
+      return { status: "existing", pageUrl: existingPage.url() };
     }
 
     const page = await context.newPage();
-    const warmup = await warmUpShopeeSession(page, {
-      targetUrl: "https://shopee.vn",
-      waitMs: config.profileWarmupDelayMs,
-    }).catch((error) => ({
-      warmed: false,
-      skipped: false,
-      error,
-    }));
-    if (warmup?.blockingIssue) {
-      process.stdout.write(
-        `Warm-up Shopee gap block/captcha (${warmup.blockingIssue.currentUrl || "unknown"}). Hay xu ly bang tay truoc khi crawl affiliate.\n`
-      );
-      await page.bringToFront().catch(() => {});
-      return;
+
+    if (!options.skipWarmup) {
+      const warmup = await warmUpShopeeSession(page, {
+        targetUrl: "https://shopee.vn",
+        waitMs: config.profileWarmupDelayMs,
+      }).catch((error) => ({
+        warmed: false,
+        skipped: false,
+        error,
+      }));
+      if (warmup?.blockingIssue) {
+        process.stdout.write(
+          `Warm-up Shopee gap block/captcha (${warmup.blockingIssue.currentUrl || "unknown"}). Hay xu ly bang tay truoc khi crawl affiliate.\n`
+        );
+        await page.bringToFront().catch(() => {});
+        return {
+          status: "warmup_blocked",
+          pageUrl: page.url(),
+          blockingIssue: warmup.blockingIssue,
+        };
+      }
     }
 
     const targetUrl = `${config.affiliateBaseUrl.replace(/\/$/, "")}/`;
     await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
     await page.bringToFront().catch(() => {});
     process.stdout.write(`Da mo san tab affiliate: ${targetUrl}\n`);
+    return { status: "affiliate_opened", pageUrl: targetUrl };
   } finally {
-    await browser.close().catch(() => {});
+    await disconnectBrowser(browser);
   }
 }
 
@@ -255,7 +288,7 @@ async function openAffiliatePageForProfile(profile) {
     await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
     await page.bringToFront().catch(() => {});
   } finally {
-    await browser.close().catch(() => {});
+    await disconnectBrowser(browser);
   }
 }
 
@@ -398,7 +431,17 @@ async function main() {
   printProfileSummary();
 
   await ensureChromeCdpReady(config.workerWaitTimeoutMs);
-  await openAffiliatePageInChrome();
+  const prep = await openAffiliatePageInChrome();
+  if (prep?.status === "warmup_blocked") {
+    await promptToContinue(
+      "Xu ly captcha/login Shopee trong cua so Chrome vua mo. Khi Shopee da vao binh thuong, nhan Enter de tool mo tiep trang affiliate va start worker."
+    );
+    await openAffiliatePageInChrome({ skipWarmup: true }).catch((error) => {
+      process.stdout.write(
+        `Khong mo tiep duoc tab affiliate sau khi xu ly captcha: ${error.message}\n`
+      );
+    });
+  }
   spawnService("server", "server.js");
   const registry = loadProfiles();
   currentWorkerProfile =
@@ -414,22 +457,13 @@ async function main() {
   try {
     await waitForWorkerReady(config.workerWaitTimeoutMs);
     process.stdout.write(
-      "Server va worker da san sang. Mo CLI trong cung terminal nay...\n"
+      "Server va worker da san sang.\n"
     );
   } catch (error) {
     process.stdout.write(
-      `${error.message}. Van tiep tuc mo CLI; worker se tu retry khi ban mo dashboard/login xong.\n`
+      `${error.message}. Worker se tu retry khi ban mo dashboard/login xong.\n`
     );
   }
-
-  const cli = spawn(process.execPath, ["cli.js"], {
-    cwd: __dirname,
-    stdio: "inherit",
-  });
-
-  cli.on("exit", (code) => {
-    shutdown(code ?? 0);
-  });
 }
 
 process.on("SIGINT", () => shutdown(130));

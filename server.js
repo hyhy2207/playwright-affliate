@@ -64,7 +64,13 @@ function normalizeOutputMode(value) {
   return shopeeProvider.normalizeOutputMode(value);
 }
 
+function isProductCacheEnabled() {
+  return config.productCacheTtlMs > 0;
+}
+
 function getCachedProduct(itemId) {
+  if (!isProductCacheEnabled()) return null;
+
   const cached = productCache.get(String(itemId || ""));
   if (!cached) return null;
 
@@ -77,7 +83,7 @@ function getCachedProduct(itemId) {
 }
 
 function setCachedProduct(product, raw, affiliateUrl) {
-  if (!product?.productID) return;
+  if (!isProductCacheEnabled() || !product?.productID) return;
 
   productCache.set(String(product.productID), {
     itemId: String(product.productID),
@@ -192,20 +198,16 @@ async function fetchProductByItemIdDirect(itemId, mode, options = {}) {
   if (!refresh) {
     const cached = getCachedProduct(itemId);
     if (cached) {
+      const product = shopeeProvider.buildProductPayload(cached, mode, {
+        productCacheTtlMs: config.productCacheTtlMs,
+      });
       return {
         statusCode: 200,
         payload: {
-          type: "SUCCESS",
-          cacheHit: true,
-          storeHit: false,
-          source: "memory",
-          itemId,
-          mode,
-          result: shopeeProvider.buildProductPayload(cached, mode, {
-            productCacheTtlMs: config.productCacheTtlMs,
-          }),
-          cachedAt: cached.cachedAt,
-          durationMs: Date.now() - startedAt,
+          data: {
+            type: "SUCCESS",
+            ...product,
+          },
         },
       };
     }
@@ -213,6 +215,9 @@ async function fetchProductByItemIdDirect(itemId, mode, options = {}) {
     const stored = await productStore.getProduct(itemId);
     if (stored) {
       const entry = shopeeProvider.buildStoreProductEntry(stored);
+      const product = shopeeProvider.buildProductPayload(entry, mode, {
+        productCacheTtlMs: config.productCacheTtlMs,
+      });
       setCachedProduct(stored.result, stored.raw, stored.affiliateUrl);
       const staleWhileRevalidate = shouldBackgroundRevalidate(stored, options);
       if (staleWhileRevalidate) {
@@ -221,18 +226,10 @@ async function fetchProductByItemIdDirect(itemId, mode, options = {}) {
       return {
         statusCode: 200,
         payload: {
-          type: "SUCCESS",
-          cacheHit: false,
-          storeHit: true,
-          source: productStore.driver,
-          itemId,
-          mode,
-          staleWhileRevalidate,
-          result: shopeeProvider.buildProductPayload(entry, mode, {
-            productCacheTtlMs: config.productCacheTtlMs,
-          }),
-          cachedAt: stored.updatedAt,
-          durationMs: Date.now() - startedAt,
+          data: {
+            type: "SUCCESS",
+            ...product,
+          },
         },
       };
     }
@@ -253,20 +250,16 @@ async function fetchProductByItemIdDirect(itemId, mode, options = {}) {
 
   const task = await waitForTaskDone(payload.taskId, config.productRequestTimeoutMs);
   if (task?.status === TASK_STATUS.SUCCESS) {
+    const product = shopeeProvider.buildTaskProductPayload(task, mode, {
+      productCacheTtlMs: config.productCacheTtlMs,
+    });
     return {
       statusCode: 200,
       payload: {
-        type: "SUCCESS",
-        cacheHit: Boolean(queued.fromCache),
-        storeHit: false,
-        source: queued.fromCache ? "memory" : "worker",
-        itemId,
-        mode,
-        result: shopeeProvider.buildTaskProductPayload(task, mode, {
-          productCacheTtlMs: config.productCacheTtlMs,
-        }),
-        task: buildTaskResponse(task, { defaultMaxRetries: config.taskMaxRetries }),
-        durationMs: Date.now() - startedAt,
+        data: {
+          type: "SUCCESS",
+          ...product,
+        },
       },
     };
   }
@@ -1161,7 +1154,15 @@ const httpServer = http.createServer(async (req, res) => {
 
   if (method === "POST" && requestUrl.pathname === "/scrape") {
     try {
+      const startedAt = Date.now();
       const body = await readJsonBody(req);
+      const waitQueryRaw = requestUrl.searchParams.get("wait");
+      const waitForResult =
+        body.wait == null
+          ? waitQueryRaw == null
+            ? true
+            : readBooleanQuery(waitQueryRaw)
+          : Boolean(body.wait);
       const payload = {
         taskId: typeof body.taskId === "string" && body.taskId.trim() ? body.taskId.trim() : crypto.randomUUID(),
         url: body.url,
@@ -1183,16 +1184,71 @@ const httpServer = http.createServer(async (req, res) => {
         return;
       }
 
-      sendHttpJson(res, result.fromCache ? 200 : 202, {
-        type: result.fromCache ? "SUCCESS" : "QUEUED",
-        message: result.fromCache
-          ? "Task tra ve tu cache"
-          : `Task da duoc dua sang worker #${result.workerClientId}`,
-        cacheHit: Boolean(result.fromCache),
-        task: buildTaskResponse(result.task, { defaultMaxRetries: config.taskMaxRetries }),
+      if (!waitForResult || result.fromCache) {
+        sendHttpJson(res, result.fromCache ? 200 : 202, {
+          type: result.fromCache ? "SUCCESS" : "QUEUED",
+          message: result.fromCache
+            ? "Task tra ve tu cache"
+            : `Task da duoc dua sang worker #${result.workerClientId}`,
+          cacheHit: Boolean(result.fromCache),
+          task: buildTaskResponse(result.task, { defaultMaxRetries: config.taskMaxRetries }),
+          meta: {
+            endpoint: "/scrape",
+            workerClientId: result.workerClientId || null,
+            waited: false,
+          },
+        });
+        return;
+      }
+
+      const task = await waitForTaskDone(payload.taskId, config.productRequestTimeoutMs);
+
+      if (task?.status === TASK_STATUS.SUCCESS) {
+        sendHttpJson(res, 200, {
+          type: "SUCCESS",
+          message: "Crawl thanh cong",
+          cacheHit: false,
+          result: task.result,
+          task: buildTaskResponse(task, { defaultMaxRetries: config.taskMaxRetries }),
+          durationMs: Date.now() - startedAt,
+          meta: {
+            endpoint: "/scrape",
+            workerClientId: result.workerClientId || null,
+            waited: true,
+          },
+        });
+        return;
+      }
+
+      if (task?.status === TASK_STATUS.ERROR) {
+        sendHttpJson(res, 502, {
+          type: "ERROR",
+          message: task.error || "Crawl that bai",
+          error: task.error,
+          errorCode: task.errorCode,
+          task: buildTaskResponse(task, { defaultMaxRetries: config.taskMaxRetries }),
+          durationMs: Date.now() - startedAt,
+          meta: {
+            endpoint: "/scrape",
+            workerClientId: result.workerClientId || null,
+            waited: true,
+          },
+        });
+        return;
+      }
+
+      sendHttpJson(res, 202, {
+        type: "QUEUED",
+        message: "Task dang xu ly, lay ket qua bang /tasks/:taskId",
+        cacheHit: false,
+        task: task
+          ? buildTaskResponse(task, { defaultMaxRetries: config.taskMaxRetries })
+          : buildTaskResponse(result.task, { defaultMaxRetries: config.taskMaxRetries }),
+        durationMs: Date.now() - startedAt,
         meta: {
           endpoint: "/scrape",
           workerClientId: result.workerClientId || null,
+          waited: true,
         },
       });
     } catch (error) {

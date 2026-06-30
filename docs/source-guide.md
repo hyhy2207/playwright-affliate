@@ -4,7 +4,7 @@ Doc này đang bao gồm:
 
 - Kiến trúc tổng thể của source hiện tại.
 
-- Vai trò từng file chính: server.js, playwright-worker.js, browser-context.js, stack.js, task-store.js, cli.js.
+- Vai trò từng file chính: server.js, playwright-worker.js, browser-context.js, stack.js, task-store.js.
 
 - Luồng chạy từ Chrome CDP, login Shopee/Affiliate, npm run stack, nhập link hoặc itemId.
 
@@ -31,7 +31,7 @@ Tai lieu nay mo ta source hien tai cua `playwright-shopee`: kien truc, cach cac 
 He thong hien tai tap trung vao 4 viec:
 
 - Giu session Shopee/Affiliate trong Chrome CDP profile.
-- Nhan input tu CLI hoac HTTP API bang Shopee URL hoac `itemId`.
+- Nhan input tu HTTP API bang Shopee URL hoac `itemId`.
 - Gui task tu server sang worker qua WebSocket.
 - Worker lay raw affiliate response roi server parse thanh JSON gon.
 
@@ -41,20 +41,19 @@ He thong hien tai tap trung vao 4 viec:
 playwright-shopee/
   browser-context.js      Quan ly Chrome/Playwright context, detect captcha/block.
   chrome-launcher.js      Kiem tra/mo Chrome CDP theo profile va port dang dung.
-  api-stack.js            Chay nen server + worker, khong mo CLI, co auto restart child process.
-  cli.js                  CLI nhap link hoac item id, poll task, in JSON va thoi gian.
+  api-stack.js            Chay nen server + worker, co auto restart child process.
   config.js               Doc .env va expose config dung chung.
   ecosystem.config.js     Cau hinh PM2 mau neu muon chay lau dai.
   logger.js               Ghi log ra console va logs/tasks.jsonl.
   playwright-worker.js    Worker attach Chrome, nhan task, lay data tu Shopee Affiliate.
   profile-launcher.js     Prompt chon profile truoc khi chay login/stack/api/worker.
   profile-manager.js      Luu registry profile, port CDP, profile mac dinh.
-  product-store.js        Adapter luu product/raw/history vao PostgreSQL hoac file fallback.
+  product-store.js        Adapter luu product/raw/history vao file fallback khi can.
   providers/shopee/       Gom logic dac thu Shopee: parse input, build affiliate URL, normalize product.
   server.js               HTTP API + WebSocket relay + parse JSON response.
-  stack.js                Chay server + worker + cli trong 1 terminal.
+  stack.js                Chay server + worker trong 1 terminal.
   task-store.js           Luu task trong RAM, status, duration.
-  task-presenter.js       Chuan hoa task response tra ve cho HTTP/CLI.
+  task-presenter.js       Chuan hoa task response tra ve cho HTTP.
   http-utils.js           Helper doc JSON body va dong goi HTTP response.
   validation.js           Validate request/worker payload.
   worker-login.js         Kiem tra profile Chrome da login Affiliate.
@@ -110,7 +109,6 @@ npm run stack
 - Khoi dong `server.js`.
 - Khoi dong `playwright-worker.js`.
 - Doi worker san sang.
-- Mo `cli.js`.
 
 Neu chay API nen:
 
@@ -126,7 +124,6 @@ npm run api
 - Doi server ready qua `/health`.
 - Khoi dong `playwright-worker.js`.
 - Doi worker ready neu co the.
-- Khong mo CLI.
 - Tu restart server/worker neu process con bi crash va `SERVICE_AUTO_RESTART=true`.
 
 ### 3.1.1. Profile registry
@@ -188,7 +185,7 @@ Hoac nhap truc tiep:
 20300919760
 ```
 
-CLI goi:
+HTTP client goi:
 
 ```http
 POST /scrape
@@ -238,19 +235,11 @@ Trong `task-store.js`, moi task co:
 - `maxRetries`: gioi han retry.
 - `nextAttemptAt`: thoi diem retry tiep theo neu co.
 
-CLI se in:
-
-```text
-- Tong thoi gian: 1.24s
-- Cho worker: 120ms
-- Xu ly + lay JSON: 1.12s
-```
-
 ## 5. Vai tro cua server.js
 
 `server.js` la trung tam relay:
 
-- Nhan HTTP request tu CLI/API.
+- Nhan HTTP request tu API.
 - Validate payload bang `validation.js`.
 - Tao task trong `task-store.js`.
 - Tim worker WebSocket dang online.
@@ -258,13 +247,13 @@ CLI se in:
 - Nhan `STARTED`, `SUCCESS`, `ERROR` tu worker.
 - Parse raw response thanh JSON cuoi cung.
 - Luu result/raw/error vao task.
-- Push update ve CLI neu CLI dang ket noi.
+- Push update ve WebSocket client neu co ket noi.
 - Retry lai task cho cac loi tam thoi nhu mat CDP.
 - `task-queue.js` la queue factory chon `memory` hoac `bullmq`.
 - `task-queue-memory.js` giu queue trong process.
 - `task-queue-bullmq.js` dua queue sang Redis/BullMQ nhung van giu contract task hien tai.
 - Khi dung `bullmq`, Redis la noi giu pending/delayed jobs that su.
-- PostgreSQL luu `task_history` de giu task history va phuc hoi task active metadata sau restart.
+- Product store local co the giu `task_history` de phuc hoi task active metadata sau restart.
 - Neu `bullmq` init that bai, system co the fallback ve `memory` qua `QUEUE_DRIVER_FALLBACK`.
 - Neu worker disconnect, task dang `queued/running` cua worker do se duoc requeue.
 - Keyword warm-up truoc khi vao affiliate co the doi bang `PROFILE_WARMUP_KEYWORDS`.
@@ -315,19 +304,19 @@ Lay chi tiet task, bao gom timing va result.
 
 `GET /product/<itemId>`
 
-Lay nhanh theo item id. Endpoint nay se check cache RAM truoc, tiep theo PostgreSQL, neu miss moi tao task sang worker va doi toi da `PRODUCT_REQUEST_TIMEOUT_MS`.
+Lay nhanh theo item id. O cau hinh mac dinh hien tai, endpoint nay bo qua cache/store va tao task sang worker de lay du lieu moi, doi toi da `PRODUCT_REQUEST_TIMEOUT_MS`. Neu ban bat lai cache/store thi server se uu tien cache RAM truoc, tiep theo persistence store.
 
 Query `mode`:
 
-- `compact`: tra JSON gon dang dung cho CLI/API.
+- `compact`: tra JSON gon cho API.
 - `full`: tra JSON gon kem raw Shopee response va thong tin cache.
 - `raw`: tra raw Shopee Affiliate response.
 
-Query `refresh=1` se bo qua cache/DB va ep worker crawl lai.
+Query `refresh=1` van co tac dung khi ban bat lai cache/store: bo qua cache/DB va ep worker crawl lai.
 
 `GET /products`
 
-Lay danh sach product da luu trong PostgreSQL. Query ho tro:
+Lay danh sach product da luu trong file store local neu ban bat `PRODUCT_STORE_DRIVER=file`. Query ho tro:
 
 - `limit`: mac dinh 50, toi da 200.
 - `offset`: phan trang.
@@ -505,7 +494,6 @@ Nhiem vu:
 - Start server.
 - Start worker.
 - Doi worker ready.
-- Start CLI.
 
 Lenh thuong dung:
 
@@ -517,7 +505,7 @@ Van can giu cua so Chrome CDP dang login. Neu Chrome bi dong, worker se mat cont
 
 ## 8.1. Vai tro cua api-stack.js
 
-`api-stack.js` dung khi muon chay nen, cho tool/API khac goi vao ma khong can CLI prompt.
+`api-stack.js` dung khi muon chay nen, cho tool/API khac goi vao.
 
 Lenh:
 
@@ -527,8 +515,7 @@ npm run api
 
 Khac voi `npm run stack`:
 
-- Khong mo CLI.
-- Khong tu mo tab Affiliate.
+- Khong mo tab Affiliate san.
 - Chay `server.js` va `playwright-worker.js`.
 - Tu restart child process neu server/worker crash.
 - Phu hop chay bang PM2/systemd hoac terminal nen.
@@ -613,24 +600,11 @@ Extra/Shopee commission lay theo thu tu:
 - `data.commission_rate.seller_commission`.
 - `data.commission_rate.shopee_commission`.
 
-## 10.1. PostgreSQL product store
+## 10.1. Product store local
 
-Giai doan 1 da chot PostgreSQL lam store chinh:
+Mac dinh product store dang tat (`PRODUCT_STORE_DRIVER=none`) nen task success se tra ket qua thang ve client ma khong luu persistence. Neu can luu tam local, server se ghi product sau khi worker tra `SUCCESS` va server parse thanh cong. Neu file store loi, task van success nhung log se co `product_store.upsert_failed` de debug.
 
-```env
-PRODUCT_STORE_DRIVER=postgres
-DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/playwright_shopee
-DATABASE_SSL=false
-```
-
-Khi server start, `product-store.js` tu tao schema:
-
-- `products`: luu product JSON moi nhat theo `item_id`, raw response, affiliate URL, source, created/updated time.
-- `price_history`: append mot dong moi moi lan crawl thanh cong, dung de ve bieu do gia/commission/sold sau nay.
-
-Luon ghi product vao PostgreSQL sau khi worker tra `SUCCESS` va server parse thanh cong. Neu PostgreSQL loi, task van success nhung log se co `product_store.upsert_failed` de debug.
-
-Neu can dev tam khong DB, co the set:
+Neu can luu tam local, co the set:
 
 ```env
 PRODUCT_STORE_DRIVER=file
@@ -642,15 +616,13 @@ File fallback chi de dev, khong nen dung cho web production.
 
 ```env
 BROWSER_CDP_URL=http://127.0.0.1:9222
-PRODUCT_CACHE_TTL_MS=300000
+PRODUCT_CACHE_TTL_MS=0
 PRODUCT_REQUEST_TIMEOUT_MS=10000
 PRODUCT_BATCH_LIMIT=20
-PRODUCT_STORE_DRIVER=postgres
+PRODUCT_STORE_DRIVER=none
 PRODUCT_DATA_DIR=data
 PRODUCT_STORE_FILE=products.json
 PRODUCT_HISTORY_FILE=price-history.jsonl
-DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/playwright_shopee
-DATABASE_SSL=false
 TASK_QUEUE_TIMEOUT_MS=10000
 TASK_TIMEOUT_MS=15000
 LOG_MAX_BYTES=10485760
@@ -666,13 +638,11 @@ TASK_POLL_MS=200
 Y nghia:
 
 - `BROWSER_CDP_URL`: Chrome that de Playwright attach vao.
-- `PRODUCT_CACHE_TTL_MS`: thoi gian giu cache theo `itemId`.
+- `PRODUCT_CACHE_TTL_MS`: thoi gian giu cache theo `itemId`. Dat `0` de tat cache RAM hoan toan.
 - `PRODUCT_REQUEST_TIMEOUT_MS`: thoi gian endpoint `/product/:itemId` doi task hoan tat truoc khi tra `202`.
 - `PRODUCT_BATCH_LIMIT`: so product toi da cho `POST /products/batch`.
-- `PRODUCT_STORE_DRIVER`: `postgres` cho production, `file` cho dev tam.
+- `PRODUCT_STORE_DRIVER`: `none` de tat persistence, `file` de luu tam local.
 - `PRODUCT_DATA_DIR`, `PRODUCT_STORE_FILE`, `PRODUCT_HISTORY_FILE`: file fallback khi `PRODUCT_STORE_DRIVER=file`.
-- `DATABASE_URL`: PostgreSQL connection string.
-- `DATABASE_SSL`: bat SSL khi ket noi database hosted.
 - `TASK_QUEUE_TIMEOUT_MS`: queued qua moc nay se thanh error.
 - `TASK_TIMEOUT_MS`: running qua moc nay se thanh error.
 - `LOG_MAX_BYTES`: dung luong toi da cua `logs/tasks.jsonl` truoc khi rotate sang `.1`.
@@ -682,7 +652,7 @@ Y nghia:
 - `WORKER_WAIT_POLL_MS`: khoang retry worker/socket.
 - `SERVICE_AUTO_RESTART`: `npm run api` co tu restart child process khong.
 - `SERVICE_RESTART_DELAY_MS`: thoi gian doi truoc khi restart child process.
-- `TASK_POLL_MS`: CLI poll task nhanh/cham.
+- `TASK_POLL_MS`: tan suat poll task cho cac luong can doi task xong.
 
 Muon nhanh hon co the giam:
 
@@ -764,7 +734,7 @@ Moi log co cac field timing:
 - `gotoMs`: thoi gian fallback goto va cho API response.
 - `attempts`: danh sach GET/POST fast API da thu, status va thoi gian moi lan.
 
-Muc tieu la biet request cham do API, do fallback, do server parse, hay do CLI poll. Server cung log `parseMs` trong event `task.succeeded`.
+Muc tieu la biet request cham do API, do fallback, hay do server parse. Server cung log `parseMs` trong event `task.succeeded`.
 
 ### 13.2. Cache item id
 
@@ -843,7 +813,7 @@ Nhu vay UI/API goi ngoai biet khi nao can user vao Chrome xu ly captcha.
 
 Hien tai da co:
 
-- `npm run api`: chi chay server + worker, khong mo CLI.
+- `npm run api`: chi chay server + worker.
 - `ecosystem.config.js`: PM2 config mau.
 - Log rotation 1 file: khi `logs/tasks.jsonl` qua `LOG_MAX_BYTES`, file cu duoc doi thanh `logs/tasks.jsonl.1`.
 - Auto restart child process trong `api-stack.js` khi server/worker crash.

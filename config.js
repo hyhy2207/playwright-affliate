@@ -17,6 +17,18 @@ function readNumberEnv(name, fallback) {
   return parsed;
 }
 
+function readNonNegativeNumberEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || raw === "") return fallback;
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`ENV ${name} phai la so khong am hop le`);
+  }
+
+  return parsed;
+}
+
 function readStringEnv(name, fallback) {
   const raw = process.env[name];
   return raw == null || raw === "" ? fallback : raw;
@@ -65,7 +77,7 @@ const config = {
   taskRetentionMs: readNumberEnv("TASK_RETENTION_MS", 30 * 60 * 1000),
   taskQueueTimeoutMs: readNumberEnv("TASK_QUEUE_TIMEOUT_MS", 10 * 1000),
   taskTimeoutMs: readNumberEnv("TASK_TIMEOUT_MS", 15 * 1000),
-  productCacheTtlMs: readNumberEnv("PRODUCT_CACHE_TTL_MS", 5 * 60 * 1000),
+  productCacheTtlMs: readNonNegativeNumberEnv("PRODUCT_CACHE_TTL_MS", 0),
   productRequestTimeoutMs: readNumberEnv(
     "PRODUCT_REQUEST_TIMEOUT_MS",
     10 * 1000,
@@ -73,7 +85,7 @@ const config = {
   productBatchLimit: readNumberEnv("PRODUCT_BATCH_LIMIT", 20),
   productStoreDriver: readStringEnv(
     "PRODUCT_STORE_DRIVER",
-    "postgres",
+    "none",
   ).toLowerCase(),
   productDataDir: readStringEnv("PRODUCT_DATA_DIR", "data"),
   productStoreFile: readStringEnv("PRODUCT_STORE_FILE", "products.json"),
@@ -82,8 +94,6 @@ const config = {
     "price-history.jsonl",
   ),
   productStoreFlushMs: readNumberEnv("PRODUCT_STORE_FLUSH_MS", 250),
-  databaseUrl: readStringEnv("DATABASE_URL", ""),
-  databaseSsl: readStringEnv("DATABASE_SSL", "false").toLowerCase() === "true",
   workerWaitTimeoutMs: readNumberEnv("WORKER_WAIT_TIMEOUT_MS", 30 * 1000),
   workerWaitPollMs: readNumberEnv("WORKER_WAIT_POLL_MS", 500),
   serviceAutoRestart:

@@ -7,7 +7,7 @@ const readline = require("readline");
 
 const { config } = require("./config");
 const { ensureChromeCdpReady: ensureChromeCdpReadyExternal } = require("./chrome-launcher");
-const { warmUpShopeeSession } = require("./browser-context");
+const { disconnectBrowser, warmUpShopeeSession } = require("./browser-context");
 const {
   buildProfileEnv,
   findDefaultProfile,
@@ -295,7 +295,7 @@ async function openAffiliatePageForProfile(profile) {
     await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
     await page.bringToFront().catch(() => {});
   } finally {
-    await browser.close().catch(() => {});
+    await disconnectBrowser(browser);
   }
 }
 

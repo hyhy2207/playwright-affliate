@@ -7,7 +7,7 @@ Ban nay la huong di song song voi `extension-shopee`, nhung thay worker Chrome E
 
 - Giu session affiliate tren 1 browser profile co dinh
 - Crawl bang browser that, khong can MV3 extension
-- Tiep tuc dung lai `server`, `task-store`, `cli`, `HTTP API`
+- Tiep tuc dung lai `server`, `task-store`, `HTTP API`
 
 ## Cau truc
 
@@ -18,8 +18,7 @@ Ban nay la huong di song song voi `extension-shopee`, nhung thay worker Chrome E
 - `profile-manager.js`: luu danh sach profile va profile mac dinh
 - `providers/shopee/`: gom logic dac thu Shopee de sau nay tach them provider khac de hon
 - `http-utils.js`: helper cho HTTP response/request body
-- `task-presenter.js`: chuan hoa task response cho API/CLI
-- `cli.js`: prompt `>` de paste link Shopee
+- `task-presenter.js`: chuan hoa task response cho API
 
 Tai lieu source chi tiet:
 
@@ -33,26 +32,20 @@ npm install
 cp .env.example .env
 ```
 
-## PostgreSQL
+## Store va cache mac dinh
 
-Giai doan 1 dung PostgreSQL de luu product/raw/history. Tao database local:
-
-```bash
-createdb playwright_shopee
-```
-
-Hoac neu dung user/password rieng, sua trong `.env`:
+Ban nay mac dinh khong dung product store DB va khong giu cache RAM product. Moi request product se di qua worker de lay du lieu moi tu Shopee.
 
 ```bash
-PRODUCT_STORE_DRIVER=postgres
-DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/playwright_shopee
-DATABASE_SSL=false
+PRODUCT_STORE_DRIVER=none
+PRODUCT_CACHE_TTL_MS=0
 ```
 
-Khi `npm run api` hoac `npm run stack`, server se tu tao bang:
+Neu can luu product/raw/history de debug hoac nghien cuu, ban co the bat file store local:
 
-- `products`: product JSON moi nhat theo `itemId`.
-- `price_history`: lich su gia/commission moi lan crawl thanh cong.
+```bash
+PRODUCT_STORE_DRIVER=file
+```
 
 ## Config quan trong
 
@@ -67,15 +60,13 @@ TASK_TIMEOUT_MS=15000
 TASK_MAX_RETRIES=2
 TASK_RETRY_DELAY_MS=1500
 TASK_HISTORY_PER_ITEM_LIMIT=3
-PRODUCT_CACHE_TTL_MS=300000
+PRODUCT_CACHE_TTL_MS=0
 PRODUCT_REQUEST_TIMEOUT_MS=10000
 PRODUCT_BATCH_LIMIT=20
-PRODUCT_STORE_DRIVER=postgres
+PRODUCT_STORE_DRIVER=none
 PRODUCT_DATA_DIR=data
 PRODUCT_STORE_FILE=products.json
 PRODUCT_HISTORY_FILE=price-history.jsonl
-DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/playwright_shopee
-DATABASE_SSL=false
 WORKER_WAIT_TIMEOUT_MS=30000
 WORKER_WAIT_POLL_MS=500
 SERVICE_AUTO_RESTART=true
@@ -154,7 +145,7 @@ He thong hien tai co them cac co che:
 - `task-queue-memory.js` giu co che queue trong process nhu hien tai.
 - `task-queue-bullmq.js` cho phep dua queue len Redis/BullMQ ma khong doi API ben ngoai.
 - Khi dung `bullmq`, Redis se giu pending/delayed jobs that su; khong can `tasks-pending.json` de khoi phuc job nua.
-- PostgreSQL luu `task_history` de giu lich su task va phuc hoi metadata task active khi server restart.
+- File store local co the giu `task_history` de phuc hoi metadata task active khi server restart khi ban bat `PRODUCT_STORE_DRIVER=file`.
 - `task_history` se tu dong prune bot cac ban ghi `success/error` cu theo tung `itemId`; mac dinh giu lai `TASK_HISTORY_PER_ITEM_LIMIT=3` ban ghi moi nhat moi san pham de tranh phinh bang khi cung mot SP bi goi bang URL va `itemId`.
 - Retry task tu dong cho loi tam thoi nhu `WORKER_ERROR`, `CDP_DISCONNECTED`.
 - Giam toc theo profile bang `PROFILE_MIN_TASK_GAP_MS` de tranh ban request qua sat.
@@ -178,7 +169,7 @@ Luu y:
 - `memory` van la mode mac dinh de an toan.
 - `bullmq` can `bullmq` + `ioredis` trong `package.json` va Redis dang chay.
 - Neu `QUEUE_DRIVER=bullmq` nhung Redis/chuoi ket noi chua san sang, he thong co the roi ve `QUEUE_DRIVER_FALLBACK=memory`.
-- PostgreSQL van dung de luu product/history/task data, khong thay the vai tro cua Redis queue.
+- Product store local chi lo phan luu product/history/task data khi can, khong thay the vai tro cua Redis queue.
 
 Luu y:
 
@@ -292,7 +283,8 @@ Hoac chay thang lenh login/stack, script se hoi profile truoc khi mo.
 
 ## Lưu ý quan trọng tránh bị khóa acc (quan trọng quan trọng cực quan trọng):
 
-- Sau khi tạo profile mới, ấn `Ctrl C` sau đó chạy bước 2, nên đăng nhập shopee trước -> xử lý capcha thành công -> đăng nhập affiliate -> xử lý tiếp capcha nếu có -> Thành công ấn `Ctrl C` -> `npm run stack`
+- Sau khi tạo profile mới, uu tien dang nhap Shopee truoc va xu ly captcha cho on dinh.
+- Khi chay `npm run stack`, neu Shopee bi day ve captcha/verify thi cu xu ly bang tay tren tab Shopee; khi Shopee da vao binh thuong thi nhan `Enter` de tool mo tiep trang Affiliate.
 
 ## 2. Mo Chrome CDP
 
@@ -311,7 +303,7 @@ google-chrome --remote-debugging-port=9223 --user-data-dir=.profiles/thanhhuy2
 Giu terminal nay dang chay. Chrome mo ra tu lenh nay se dung profile rieng tai thu muc da chon.
 
 Neu ban chay `npm run login` hoac `npm run stack` sau khi chon profile, tool cung co the tu thu mo Chrome CDP voi dung port/profile cua profile do.
-Neu profile moi thuong bi captcha, nen login bang tay va de warm-up chay xong truoc khi crawl.
+Neu `npm run stack` mo Shopee va gap captcha, tool se dung lai de ban xu ly bang tay. Sau khi Shopee on dinh, nhan `Enter` de tool mo tiep tab Affiliate va start worker.
 
 ## 3. Dang nhap profile Chrome
 
@@ -339,7 +331,7 @@ Buoc nay rat quan trong vi Shopee hay chan neu vao Affiliate ngay khi session Sh
 
 ## 5. Dang nhap Shopee Affiliate
 
-Sau khi Shopee da on dinh, mo tiep:
+Sau khi Shopee da on dinh, tool se mo tiep:
 
 ```text
 https://affiliate.shopee.vn/dashboard
@@ -419,21 +411,8 @@ Lenh nay se tu dong:
 - Khoi dong HTTP server
 - Khoi dong Playwright worker
 - Cho worker san sang
-- Mo CLI
 
-Sau do paste link Shopee hoac item id:
-
-```text
-https://shopee.vn/product/344837665/57458114650
-```
-
-hoac
-
-```text
-57458114650
-```
-
-Neu muon chay API nen, khong mo CLI:
+Neu muon chay API nen:
 
 ```bash
 npm run api
@@ -451,7 +430,7 @@ Lenh nay se:
 - Khoi dong HTTP server.
 - Khoi dong Playwright worker.
 - Tu restart server/worker neu process bi crash.
-- Khong mo prompt CLI, phu hop de tool khac goi HTTP API.
+- Phu hop de tool khac goi HTTP API.
 
 Neu co PM2:
 
@@ -493,13 +472,13 @@ Lay chi tiet task:
 curl http://localhost:8080/tasks/<task-id>
 ```
 
-Lay nhanh theo item id, co cache:
+Lay nhanh theo item id. Mac dinh van crawl moi qua worker vi cache/store dang tat:
 
 ```bash
 curl "http://localhost:8080/product/57458114650"
 ```
 
-Ep crawl lai, bo qua cache/DB:
+Neu sau nay ban bat lai cache/store, co the ep crawl lai bang `refresh=1`:
 
 ```bash
 curl "http://localhost:8080/product/57458114650?refresh=1"
@@ -511,18 +490,6 @@ Chon format ket qua:
 curl "http://localhost:8080/product/57458114650?mode=compact"
 curl "http://localhost:8080/product/57458114650?mode=full"
 curl "http://localhost:8080/product/57458114650?mode=raw"
-```
-
-Lay danh sach product da luu trong PostgreSQL:
-
-```bash
-curl "http://localhost:8080/products?limit=20&offset=0"
-```
-
-Lay lich su gia/commission:
-
-```bash
-curl "http://localhost:8080/products/57458114650/history?limit=100"
 ```
 
 Lay nhieu product mot lan:
@@ -556,18 +523,6 @@ Xoa task khoi RAM:
 ```bash
 curl -X DELETE http://localhost:8080/tasks/<task-id>
 ```
-
----
-
-# CLI commands
-
-- `health`
-- `tasks`
-- `tasks success`
-- `status <taskId>`
-- `exit`
-
----
 
 # Ghi chu
 

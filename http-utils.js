@@ -24,21 +24,15 @@ function buildHttpSuccessEnvelope(payload) {
   if (payload && typeof payload === "object" && !Array.isArray(payload)) {
     const { ok, ...rest } = payload;
     if ("data" in rest) {
-      return {
-        ok: true,
-        ...rest,
-      };
+      return rest;
     }
 
     return {
-      ok: true,
       data: rest,
-      ...rest,
     };
   }
 
   return {
-    ok: true,
     data: payload,
   };
 }
