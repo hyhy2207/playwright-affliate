@@ -9,18 +9,7 @@ const WebSocket = require("ws");
 
 const { config } = require("./config");
 const { logger } = require("./logger");
-const {
-  extractItemIdFromInput,
-  getRequestItemId,
-  parseWsCommand: parseShopeeWsCommand,
-} = require("./providers/shopee/input");
-const { normalizeShopeeProduct } = require("./providers/shopee/normalize-product");
-const {
-  buildProductPayload,
-  buildStoreProductEntry,
-  buildTaskProductPayload,
-  normalizeOutputMode,
-} = require("./providers/shopee/output");
+const shopeeProvider = require("./providers/shopee");
 const {
   buildErrorMessage,
   normalizeHttpPayload,
@@ -52,6 +41,7 @@ let nextClientId = 1;
 
 const requesterSockets = new Map();
 const productCache = new Map();
+const inFlightProductRequests = new Map();
 let taskQueue = createTaskQueue({ taskStore, logger, config });
 
 let latestWorkerSession = {
@@ -69,6 +59,10 @@ const RETRYABLE_ERROR_CODES = new Set([
   "WORKER_ERROR",
   "CDP_DISCONNECTED",
 ]);
+
+function normalizeOutputMode(value) {
+  return shopeeProvider.normalizeOutputMode(value);
+}
 
 function getCachedProduct(itemId) {
   const cached = productCache.get(String(itemId || ""));
@@ -143,26 +137,7 @@ async function markTaskHistoryStale(task, errorCode, errorMessage) {
 }
 
 function waitForTaskDone(taskId, timeoutMs) {
-  const startedAt = Date.now();
-
-  return new Promise((resolve) => {
-    const tick = () => {
-      const task = taskStore.getTask(taskId);
-      if (!task || isCompletedTask(task)) {
-        resolve(task);
-        return;
-      }
-
-      if (Date.now() - startedAt >= timeoutMs) {
-        resolve(task);
-        return;
-      }
-
-      setTimeout(tick, Math.min(config.taskPollMs, 100));
-    };
-
-    tick();
-  });
+  return taskStore.waitForTaskCompletion(taskId, timeoutMs);
 }
 
 async function readProductStoreSize() {
@@ -173,7 +148,44 @@ async function readProductStoreSize() {
   }
 }
 
-async function fetchProductByItemId(itemId, mode, options = {}) {
+function shouldBackgroundRevalidate(stored, options = {}) {
+  if (!options.staleWhileRevalidate || !stored?.updatedAt) {
+    return false;
+  }
+
+  const updatedAtMs = new Date(stored.updatedAt).getTime();
+  if (!Number.isFinite(updatedAtMs)) {
+    return true;
+  }
+
+  return Date.now() - updatedAtMs >= config.productCacheTtlMs;
+}
+
+function triggerBackgroundProductRefresh(itemId, mode, source = "store") {
+  const refreshMode = normalizeOutputMode(mode || "compact");
+  const refreshKey = `${String(itemId)}:${refreshMode}:refresh`;
+  if (inFlightProductRequests.has(refreshKey)) {
+    return;
+  }
+
+  logger.info("product.revalidate_scheduled", {
+    itemId,
+    mode: refreshMode,
+    source,
+  });
+
+  void fetchProductByItemId(itemId, refreshMode, {
+    refresh: true,
+    staleWhileRevalidate: false,
+  }).catch((error) => {
+    logger.warn("product_store.upsert_failed", {
+      itemId,
+      message: `Background refresh loi: ${error.message}`,
+    });
+  });
+}
+
+async function fetchProductByItemIdDirect(itemId, mode, options = {}) {
   const startedAt = Date.now();
   const refresh = Boolean(options.refresh);
 
@@ -189,7 +201,7 @@ async function fetchProductByItemId(itemId, mode, options = {}) {
           source: "memory",
           itemId,
           mode,
-          result: buildProductPayload(cached, mode, {
+          result: shopeeProvider.buildProductPayload(cached, mode, {
             productCacheTtlMs: config.productCacheTtlMs,
           }),
           cachedAt: cached.cachedAt,
@@ -200,8 +212,12 @@ async function fetchProductByItemId(itemId, mode, options = {}) {
 
     const stored = await productStore.getProduct(itemId);
     if (stored) {
-      const entry = buildStoreProductEntry(stored);
+      const entry = shopeeProvider.buildStoreProductEntry(stored);
       setCachedProduct(stored.result, stored.raw, stored.affiliateUrl);
+      const staleWhileRevalidate = shouldBackgroundRevalidate(stored, options);
+      if (staleWhileRevalidate) {
+        triggerBackgroundProductRefresh(itemId, mode, "store");
+      }
       return {
         statusCode: 200,
         payload: {
@@ -211,7 +227,8 @@ async function fetchProductByItemId(itemId, mode, options = {}) {
           source: productStore.driver,
           itemId,
           mode,
-          result: buildProductPayload(entry, mode, {
+          staleWhileRevalidate,
+          result: shopeeProvider.buildProductPayload(entry, mode, {
             productCacheTtlMs: config.productCacheTtlMs,
           }),
           cachedAt: stored.updatedAt,
@@ -245,7 +262,7 @@ async function fetchProductByItemId(itemId, mode, options = {}) {
         source: queued.fromCache ? "memory" : "worker",
         itemId,
         mode,
-        result: buildTaskProductPayload(task, mode, {
+        result: shopeeProvider.buildTaskProductPayload(task, mode, {
           productCacheTtlMs: config.productCacheTtlMs,
         }),
         task: buildTaskResponse(task, { defaultMaxRetries: config.taskMaxRetries }),
@@ -280,6 +297,25 @@ async function fetchProductByItemId(itemId, mode, options = {}) {
       durationMs: Date.now() - startedAt,
     },
   };
+}
+
+async function fetchProductByItemId(itemId, mode, options = {}) {
+  const refresh = Boolean(options.refresh);
+  const inFlightKey = `${String(itemId)}:${String(mode || "compact")}:${refresh ? "refresh" : "default"}`;
+
+  if (inFlightProductRequests.has(inFlightKey)) {
+    return inFlightProductRequests.get(inFlightKey);
+  }
+
+  const requestPromise = fetchProductByItemIdDirect(itemId, mode, options)
+    .finally(() => {
+      if (inFlightProductRequests.get(inFlightKey) === requestPromise) {
+        inFlightProductRequests.delete(inFlightKey);
+      }
+    });
+
+  inFlightProductRequests.set(inFlightKey, requestPromise);
+  return requestPromise;
 }
 
 function sendJson(ws, payload) {
@@ -335,7 +371,7 @@ function registerTask(payload, requester) {
     status: TASK_STATUS.QUEUED,
   });
 
-  task.itemId = getRequestItemId(payload) || null;
+  task.itemId = shopeeProvider.getRequestItemId(payload) || null;
   task.requestPayload = {
     taskId: payload.taskId,
     url: payload.url || "",
@@ -390,7 +426,7 @@ function parseIncomingMessage(raw) {
 }
 
 function parseWsCommand(rawText) {
-  const parsed = parseShopeeWsCommand(rawText);
+  const parsed = shopeeProvider.parseWsCommand(rawText);
   if (!parsed?.payload) return null;
 
   return {
@@ -567,7 +603,7 @@ function enqueueTaskForWorker(payload, requester) {
     };
   }
 
-  const itemId = getRequestItemId(payload);
+  const itemId = shopeeProvider.getRequestItemId(payload);
   const cached = itemId && !payload.skipCache ? getCachedProduct(itemId) : null;
   if (cached) {
     const task = registerTask(payload, requester);
@@ -989,7 +1025,7 @@ const httpServer = http.createServer(async (req, res) => {
       mode,
       source: productStore.driver,
       products: payload.items.map((record) =>
-        buildProductPayload(buildStoreProductEntry(record), mode, {
+        shopeeProvider.buildProductPayload(shopeeProvider.buildStoreProductEntry(record), mode, {
           productCacheTtlMs: config.productCacheTtlMs,
         }),
       ),
@@ -1036,6 +1072,8 @@ const httpServer = http.createServer(async (req, res) => {
       const body = await readJsonBody(req);
       const mode = normalizeOutputMode(body.mode || requestUrl.searchParams.get("mode"));
       const refresh = Boolean(body.refresh) || readBooleanQuery(requestUrl.searchParams.get("refresh"));
+      const staleWhileRevalidate =
+        Boolean(body.stale) || readBooleanQuery(requestUrl.searchParams.get("stale"));
       const rawItems = Array.isArray(body.itemIds)
         ? body.itemIds
         : Array.isArray(body.items)
@@ -1044,11 +1082,11 @@ const httpServer = http.createServer(async (req, res) => {
             ? body.urls
             : [];
       const itemIds = Array.from(
-        new Set(rawItems.map(extractItemIdFromInput).filter(isValidItemId)),
+        new Set(rawItems.map(shopeeProvider.extractItemIdFromInput).filter(isValidItemId)),
       );
       const invalidItems = rawItems
         .map((item) => String(item || "").trim())
-        .filter((item) => item && !isValidItemId(extractItemIdFromInput(item)));
+        .filter((item) => item && !isValidItemId(shopeeProvider.extractItemIdFromInput(item)));
 
       if (itemIds.length === 0) {
         sendHttpJson(res, 400, buildErrorMessage("Thieu itemIds/items/urls hop le"));
@@ -1065,7 +1103,10 @@ const httpServer = http.createServer(async (req, res) => {
 
       const results = await Promise.all(
         itemIds.map(async (itemId) => {
-          const result = await fetchProductByItemId(itemId, mode, { refresh });
+          const result = await fetchProductByItemId(itemId, mode, {
+            refresh,
+            staleWhileRevalidate,
+          });
           return normalizeHttpPayload(result.statusCode, {
             itemId,
             statusCode: result.statusCode,
@@ -1078,6 +1119,7 @@ const httpServer = http.createServer(async (req, res) => {
         type: "BATCH",
         mode,
         refresh,
+        staleWhileRevalidate,
         total: results.length,
         invalidItems,
         results,
@@ -1102,13 +1144,17 @@ const httpServer = http.createServer(async (req, res) => {
     const itemId = decodeURIComponent(requestUrl.pathname.slice("/product/".length)).trim();
     const mode = normalizeOutputMode(requestUrl.searchParams.get("mode"));
     const refresh = readBooleanQuery(requestUrl.searchParams.get("refresh"));
+    const staleWhileRevalidate = readBooleanQuery(requestUrl.searchParams.get("stale"));
 
     if (!isValidItemId(itemId)) {
       sendHttpJson(res, 400, buildErrorMessage("itemId khong hop le", { itemId }));
       return;
     }
 
-    const result = await fetchProductByItemId(itemId, mode, { refresh });
+    const result = await fetchProductByItemId(itemId, mode, {
+      refresh,
+      staleWhileRevalidate,
+    });
     sendHttpJson(res, result.statusCode, result.payload);
     return;
   }
@@ -1424,7 +1470,7 @@ wss.on("connection", (ws) => {
 
       try {
         const parseStartedAt = Date.now();
-        const product = normalizeShopeeProduct(payload.data);
+        const product = shopeeProvider.normalizeProduct(payload.data);
         const parseMs = Date.now() - parseStartedAt;
         setCachedProduct(product, payload.data, payload.url);
         void persistProduct(product, payload.data, payload.url, "worker");

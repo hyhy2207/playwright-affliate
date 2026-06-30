@@ -116,6 +116,14 @@ function normalizeShopeeProduct(rawData) {
     item.product_link ||
     item.offerLink ||
     "";
+  const shopId = String(
+    item.shopid ??
+      item.shop_id ??
+      item.shopId ??
+      data.shop_id ??
+      data.shopId ??
+      "",
+  );
 
   const product = {
     productID: String(
@@ -132,6 +140,7 @@ function normalizeShopeeProduct(rawData) {
     imageUrl: buildShopeeImageUrl(
       item.image || item.imageUrl || item.image_url,
     ),
+    shopId,
     shopName: item.shop_name || item.shopName || data.shop_name || "",
     commission,
     hasExtraCommission: extraCommission > 0,
