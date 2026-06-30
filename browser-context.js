@@ -5,6 +5,17 @@ const path = require("path");
 
 const { config } = require("./config");
 
+async function disconnectBrowser(browser) {
+  if (!browser) return;
+
+  if (typeof browser.disconnect === "function") {
+    browser.disconnect();
+    return;
+  }
+
+  await browser.close().catch(() => {});
+}
+
 const BLOCKING_PAGE_PATTERNS = [
   /loading issue/i,
   /please try again/i,
@@ -67,7 +78,7 @@ async function connectToChromeOverCdp() {
   const context = browser.contexts()[0];
 
   if (!context) {
-    await browser.close().catch(() => {});
+    await disconnectBrowser(browser);
     throw new Error(
       `Khong tim thay browser context tu Chrome CDP: ${config.browserCdpUrl}`
     );
@@ -77,7 +88,7 @@ async function connectToChromeOverCdp() {
     cdpUrl: config.browserCdpUrl,
     browser,
     close: async () => {
-      await browser.close().catch(() => {});
+      await disconnectBrowser(browser);
     },
     context,
     mode: "chrome_cdp",
@@ -306,4 +317,5 @@ module.exports = {
   warmUpShopeeSession,
   waitForAffiliatePageSettled,
   waitForAffiliatePageInSession,
+  disconnectBrowser,
 };
