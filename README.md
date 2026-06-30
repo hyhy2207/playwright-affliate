@@ -223,6 +223,12 @@ HTTP API da duoc chuan hoa response de frontend de dung hon:
 - Loi: luon co `ok: false`, `error.code`, `error.message`, `error.details`.
 - De giu tuong thich nguoc, cac field cu nhu `task`, `tasks`, `profiles`, `type`, `message` van duoc giu o top-level.
 
+Toi uu hien tai:
+
+- `GET /product/:itemId?stale=1`: neu DB da co ban ghi cu, API co the tra ngay du lieu store hit va tu revalidate nen.
+- `POST /products/batch` ho tro `{"stale": true}` hoac `?stale=1` voi y nghia tuong tu.
+- `server.js` da duoc doi sang provider facade (`providers/shopee/index.js`) de giam coupling vao parser/normalizer Shopee.
+
 Vi du:
 
 ```json

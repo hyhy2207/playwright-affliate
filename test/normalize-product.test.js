@@ -14,6 +14,7 @@ test("normalizeShopeeProduct maps affiliate payload to storefront product", () =
       shopee_com_final: 300,
       batch_item_for_item_card_full: {
         itemid: 987654321,
+        shopid: 123,
         name: "Test Product",
         shop_name: "Test Shop",
         image: "abc123",
@@ -31,6 +32,7 @@ test("normalizeShopeeProduct maps affiliate payload to storefront product", () =
 
   assert.equal(product.productID, "987654321");
   assert.equal(product.productName, "Test Product");
+  assert.equal(product.shopId, "123");
   assert.equal(product.shopName, "Test Shop");
   assert.equal(product.price, 25);
   assert.equal(product.minPrice, 20);

@@ -23,6 +23,37 @@ function toTimeMs(value) {
 
 function createTaskStore() {
   const tasks = new Map();
+  const taskListeners = new Map();
+
+  function notifyTaskListeners(taskId, task) {
+    const listeners = taskListeners.get(taskId);
+    if (!listeners || listeners.size === 0) return;
+
+    for (const listener of listeners) {
+      try {
+        listener(task);
+      } catch {}
+    }
+  }
+
+  function subscribeTask(taskId, listener) {
+    if (!taskId || typeof listener !== "function") {
+      return () => {};
+    }
+
+    const listeners = taskListeners.get(taskId) || new Set();
+    listeners.add(listener);
+    taskListeners.set(taskId, listeners);
+
+    return () => {
+      const current = taskListeners.get(taskId);
+      if (!current) return;
+      current.delete(listener);
+      if (current.size === 0) {
+        taskListeners.delete(taskId);
+      }
+    };
+  }
 
   function cleanupExpiredTasks() {
     const cutoff = nowMs() - config.taskRetentionMs;
@@ -34,6 +65,7 @@ function createTaskStore() {
 
       if (toTimeMs(task.updatedAt) <= cutoff) {
         tasks.delete(taskId);
+        notifyTaskListeners(taskId, null);
         removed++;
       }
     }
@@ -59,6 +91,7 @@ function createTaskStore() {
             updatedAt: timestamp,
           };
           tasks.set(taskId, nextTask);
+          notifyTaskListeners(taskId, nextTask);
           timedOut.push(nextTask);
         }
       }
@@ -76,6 +109,7 @@ function createTaskStore() {
             updatedAt: timestamp,
           };
           tasks.set(taskId, nextTask);
+          notifyTaskListeners(taskId, nextTask);
           timedOut.push(nextTask);
         }
       }
@@ -113,6 +147,7 @@ function createTaskStore() {
     };
 
     tasks.set(taskId, task);
+    notifyTaskListeners(taskId, task);
     return task;
   }
 
@@ -147,6 +182,7 @@ function createTaskStore() {
     };
 
     tasks.set(baseTask.taskId, baseTask);
+    notifyTaskListeners(baseTask.taskId, baseTask);
     return baseTask;
   }
 
@@ -188,6 +224,7 @@ function createTaskStore() {
     }
 
     tasks.set(taskId, nextTask);
+    notifyTaskListeners(taskId, nextTask);
     return nextTask;
   }
 
@@ -195,7 +232,47 @@ function createTaskStore() {
     cleanupExpiredTasks();
     const current = getTask(taskId);
     tasks.delete(taskId);
+    notifyTaskListeners(taskId, null);
     return current;
+  }
+
+  function waitForTaskCompletion(taskId, timeoutMs) {
+    const current = getTask(taskId);
+    if (!current || current.status === TASK_STATUS.SUCCESS || current.status === TASK_STATUS.ERROR) {
+      return Promise.resolve(current);
+    }
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let timeout = null;
+      let unsubscribe = () => {};
+
+      function finish(task) {
+        if (settled) return;
+        settled = true;
+        unsubscribe();
+        if (timeout) {
+          clearTimeout(timeout);
+        }
+        resolve(task);
+      }
+
+      unsubscribe = subscribeTask(taskId, (task) => {
+        if (!task || task.status === TASK_STATUS.SUCCESS || task.status === TASK_STATUS.ERROR) {
+          finish(task);
+        }
+      });
+
+      if (Number.isFinite(timeoutMs) && timeoutMs >= 0) {
+        timeout = setTimeout(() => {
+          finish(getTask(taskId));
+        }, timeoutMs);
+
+        if (typeof timeout.unref === "function") {
+          timeout.unref();
+        }
+      }
+    });
   }
 
   function listTasks(options = {}) {
@@ -217,6 +294,8 @@ function createTaskStore() {
     updateTask,
     removeTask,
     listTasks,
+    subscribeTask,
+    waitForTaskCompletion,
     cleanupExpiredTasks,
     timeoutStuckTasks,
     size() {

@@ -34,6 +34,8 @@ function formatConsoleLine(entry) {
       return `${prefix} Product store loi (${entry.driver}): ${entry.message}`;
     case "product_store.upsert_failed":
       return `${prefix} Luu product ${entry.itemId || "-"} vao store loi: ${entry.message}`;
+    case "product.revalidate_scheduled":
+      return `${prefix} Revalidate nen item ${entry.itemId} tu ${entry.source || "-"}`;
     case "socket.connected":
       return `${prefix} Client #${entry.clientId} ket noi (${entry.role})`;
     case "socket.closed":
