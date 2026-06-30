@@ -1,28 +1,26 @@
 # Playwright Shopee
 
-Ban nay la huong di song song voi `extension-shopee`, nhung thay worker Chrome Extension bang
-**Playwright + persistent Chrome profile**.
+`playwright-shopee` la crawler Shopee Affiliate dung `Playwright + Chrome profile that`, khong phu thuoc vao extension worker.
 
-## Muc tieu
+Repo hien tai tap trung vao 4 viec:
 
-- Giu session affiliate tren 1 browser profile co dinh
-- Crawl bang browser that, khong can MV3 extension
-- Tiep tuc dung lai `server`, `task-store`, `HTTP API`
+- giu session Shopee/Affiliate tren browser profile co dinh
+- crawl qua Chrome CDP hoac persistent profile
+- expose HTTP API de tool khac goi theo `itemId` hoac link Shopee
+- co queue, retry, profile registry, auto switch profile khi bi block/captcha
 
-## Cau truc
+## Thanh phan chinh
 
-- `server.js`: HTTP + WebSocket relay
-- `playwright-worker.js`: worker nhan task va mo Playwright
-- `worker-login.js`: mo profile de login thu cong
-- `profile-launcher.js`: cho chon profile truoc khi chay `login` / `stack` / `api` / `worker`
-- `profile-manager.js`: luu danh sach profile va profile mac dinh
-- `providers/shopee/`: gom logic dac thu Shopee de sau nay tach them provider khac de hon
-- `http-utils.js`: helper cho HTTP response/request body
-- `task-presenter.js`: chuan hoa task response cho API
-
-Tai lieu source chi tiet:
-
-- `docs/source-guide.md`: kien truc, logic xu ly, parser JSON, timing, loi hay gap, phuong an phat trien.
+- `server.js`: HTTP API + WebSocket relay + task queue + parse result
+- `playwright-worker.js`: attach browser, nhan task, goi API affiliate, fallback `goto`
+- `stack.js`: chay server + worker trong 1 terminal
+- `api-stack.js`: mode chay nen, tu restart child process, theo doi worker session
+- `worker-login.js`: mo browser va giup login session affiliate
+- `profile-launcher.js`: chon profile truoc khi chay `login`, `stack`, `api`, `worker`
+- `profile-manager.js`: luu registry profile trong `.profiles/profiles.json`
+- `browser-context.js`: attach CDP/persistent context, detect block/captcha, warm-up session
+- `product-store.js`: store local bang file khi can
+- `providers/shopee/`: parse input, build affiliate URL, normalize output JSON
 
 ## Cai dat
 
@@ -32,53 +30,37 @@ npm install
 cp .env.example .env
 ```
 
-## Store va cache mac dinh
-
-Ban nay mac dinh khong dung product store DB va khong giu cache RAM product. Moi request product se di qua worker de lay du lieu moi tu Shopee.
+Scripts:
 
 ```bash
-PRODUCT_STORE_DRIVER=none
-PRODUCT_CACHE_TTL_MS=0
-```
-
-Neu can luu product/raw/history de debug hoac nghien cuu, ban co the bat file store local:
-
-```bash
-PRODUCT_STORE_DRIVER=file
+npm run profiles
+npm run login
+npm run stack
+npm run api
+npm run worker
+npm run test
+npm run check
 ```
 
 ## Config quan trong
 
-```bash
+Gia tri mac dinh dang nam trong `.env.example`:
+
+```env
 PORT=8080
-LOG_DIR=logs
-TASK_LOG_FILE=tasks.jsonl
-LOG_MAX_BYTES=10485760
-TASK_RETENTION_MS=1800000
 TASK_QUEUE_TIMEOUT_MS=10000
 TASK_TIMEOUT_MS=15000
 TASK_MAX_RETRIES=2
 TASK_RETRY_DELAY_MS=1500
-TASK_HISTORY_PER_ITEM_LIMIT=3
 PRODUCT_CACHE_TTL_MS=0
 PRODUCT_REQUEST_TIMEOUT_MS=10000
 PRODUCT_BATCH_LIMIT=20
 PRODUCT_STORE_DRIVER=none
-PRODUCT_DATA_DIR=data
-PRODUCT_STORE_FILE=products.json
-PRODUCT_HISTORY_FILE=price-history.jsonl
-WORKER_WAIT_TIMEOUT_MS=30000
-WORKER_WAIT_POLL_MS=500
-SERVICE_AUTO_RESTART=true
-SERVICE_RESTART_DELAY_MS=2000
-TASK_POLL_MS=200
-WORKER_SOCKET_URL=ws://127.0.0.1:8080
+PRODUCT_STORE_FLUSH_MS=250
 QUEUE_DRIVER=memory
 QUEUE_DRIVER_FALLBACK=memory
-QUEUE_NAME=shopee-task-queue
-QUEUE_PREFIX=playwright-shopee
-QUEUE_DISPATCH_CONCURRENCY=1
 REDIS_URL=redis://127.0.0.1:6379/0
+WORKER_SOCKET_URL=ws://127.0.0.1:8080
 BROWSER_PROFILE_DIR=.profiles/default
 BROWSER_CDP_URL=http://127.0.0.1:9222
 BROWSER_CHANNEL=chrome
@@ -90,7 +72,7 @@ PROFILE_SWITCH_DEBOUNCE_MS=5000
 PROFILE_WARMUP_ENABLED=true
 PROFILE_WARMUP_DELAY_MS=4000
 PROFILE_WARMUP_DEEP_ENABLED=true
-PROFILE_WARMUP_KEYWORDS=ao,quan,giay
+PROFILE_WARMUP_KEYWORDS=dien thoai
 HEADLESS=false
 SCRAPE_TIMEOUT_MS=8000
 PAGE_SETTLE_MS=120
@@ -98,106 +80,110 @@ BLOCKING_DETECT_TIMEOUT_MS=250
 AFFILIATE_BASE_URL=https://affiliate.shopee.vn
 ```
 
-Neu ban dung Chrome system binh thuong thi giu:
+Ghi chu:
+
+- `PRODUCT_STORE_DRIVER=none` la mac dinh, nen repo khong luu product persistence.
+- `PRODUCT_CACHE_TTL_MS=0` la mac dinh, nen tat RAM cache.
+- `QUEUE_DRIVER=memory` la mac dinh.
+- `BROWSER_CDP_URL` la cach on dinh nhat de attach vao Chrome that da login.
+
+## Cach chay on dinh nhat
+
+### 1. Chon hoac tao profile
 
 ```bash
-BROWSER_CHANNEL=chrome
+npm run profiles
 ```
 
-Neu can binary rieng thi set:
+Moi profile duoc luu rieng trong `.profiles/`.
+
+- Neu co `.browser-profile` cu thi lan chay dau se migrate sang `.profiles/default`.
+- Moi profile co the co `cdpPort` rieng neu dang dung `BROWSER_CDP_URL`.
+- Registry profile nam trong `.profiles/profiles.json`.
+
+Co the chon profile truc tiep:
 
 ```bash
-BROWSER_EXECUTABLE_PATH=/path/to/chrome
+npm run login -- --profile=seller-a
+npm run stack -- --profile=seller-a
+npm run api -- --profile=seller-a
 ```
 
-Neu Shopee thuong chuyen sang `verify/traffic` hoac `verify/captcha`, uu tien attach vao Chrome that qua CDP:
+### 2. Mo Chrome CDP
 
 ```bash
-google-chrome --remote-debugging-port=<PORT_CUA_PROFILE> --user-data-dir=<THU_MUC_PROFILE>
+google-chrome --remote-debugging-port=9222 --user-data-dir=.profiles/default
 ```
 
-Sau do set:
-
-```bash
-BROWSER_CDP_URL=http://127.0.0.1:<PORT_CUA_PROFILE>
-```
-
-Vi du voi profile `thanhhuy2` dang dung port `9223`:
+Vi du profile rieng:
 
 ```bash
 google-chrome --remote-debugging-port=9223 --user-data-dir=.profiles/thanhhuy2
 ```
 
-## Quan ly nhieu profile
+### 3. Dang nhap Shopee va Affiliate
 
-He thong hien tai se luu profile da dang nhap theo tung thu muc rieng trong `.profiles/`.
+Trong cua so Chrome do:
 
-- Profile cu `.browser-profile` neu co se duoc migrate sang `.profiles/default` o lan chay dau tien.
-- Moi profile moi se co `BROWSER_PROFILE_DIR` rieng.
-- Neu dang dung `BROWSER_CDP_URL`, moi profile moi se duoc cap 1 CDP port rieng, bat dau tu port trong `.env` (vi du `9222`, `9223`, `9224`...).
-- Khi profile bi Shopee chan trong luc crawl, he thong se dua profile do vao cooldown trong `PROFILE_COOLDOWN_MS` va thu doi sang profile khac con san sang.
-
-## On dinh va tu phuc hoi
-
-He thong hien tai co them cac co che:
-
-- `task-queue.js` la queue factory, co the chay bang `memory` hoac `bullmq`.
-- `task-queue-memory.js` giu co che queue trong process nhu hien tai.
-- `task-queue-bullmq.js` cho phep dua queue len Redis/BullMQ ma khong doi API ben ngoai.
-- Khi dung `bullmq`, Redis se giu pending/delayed jobs that su; khong can `tasks-pending.json` de khoi phuc job nua.
-- File store local co the giu `task_history` de phuc hoi metadata task active khi server restart khi ban bat `PRODUCT_STORE_DRIVER=file`.
-- `task_history` se tu dong prune bot cac ban ghi `success/error` cu theo tung `itemId`; mac dinh giu lai `TASK_HISTORY_PER_ITEM_LIMIT=3` ban ghi moi nhat moi san pham de tranh phinh bang khi cung mot SP bi goi bang URL va `itemId`.
-- Retry task tu dong cho loi tam thoi nhu `WORKER_ERROR`, `CDP_DISCONNECTED`.
-- Giam toc theo profile bang `PROFILE_MIN_TASK_GAP_MS` de tranh ban request qua sat.
-- Auto-switch profile khi dang crawl ma Shopee tra `captcha/loading issue/block`.
-- Warm-up sau hon cho profile moi qua `shopee.vn`, `mall`, `search` truoc khi vao Affiliate neu `PROFILE_WARMUP_DEEP_ENABLED=true`.
-- Co the doi keyword warm-up qua `PROFILE_WARMUP_KEYWORDS` trong `.env`, vi du `ao,quan,giay,the thao`.
-- Neu worker mat ket noi luc dang xu ly, cac task chua xong se duoc dua lai vao queue de cho worker ket noi lai.
-
-Neu muon bat dau chuyen sang BullMQ:
+- dang nhap `https://shopee.vn`
+- xu ly captcha, `verify/traffic`, `loading issue` neu co
+- sau do chay:
 
 ```bash
-QUEUE_DRIVER=bullmq
-REDIS_URL=redis://127.0.0.1:6379/0
-QUEUE_NAME=shopee-task-queue
-QUEUE_PREFIX=playwright-shopee
-QUEUE_DISPATCH_CONCURRENCY=1
+npm run login
 ```
 
-Luu y:
+`npm run login` se warm-up session va mo san tab `https://affiliate.shopee.vn/`.
 
-- `memory` van la mode mac dinh de an toan.
-- `bullmq` can `bullmq` + `ioredis` trong `package.json` va Redis dang chay.
-- Neu `QUEUE_DRIVER=bullmq` nhung Redis/chuoi ket noi chua san sang, he thong co the roi ve `QUEUE_DRIVER_FALLBACK=memory`.
-- Product store local chi lo phan luu product/history/task data khi can, khong thay the vai tro cua Redis queue.
+### 4. Chay he thong
 
-Luu y:
-
-- `SESSION_STATUS` chi duoc phat khi task dang crawl ma bi Shopee chan.
-- Auto-switch se bo qua profile dang cooldown hoac bi disable.
-- Task crawl co the thay `retryCount`, `maxRetries`, `nextAttemptAt` trong API `/tasks/:taskId`.
-
-Co 3 cach chon profile:
+Mode thuong dung:
 
 ```bash
-npm run profiles
-npm run login
 npm run stack
 ```
 
-Co the xoa profile bang menu:
+Lenh nay se:
+
+- bao dam Chrome CDP dang san sang
+- mo/warm-up tab affiliate neu can
+- start `server.js`
+- start `playwright-worker.js`
+- theo doi `/session` de auto switch profile neu worker gap captcha/login/block
+
+Mode chay nen:
 
 ```bash
-npm run profiles
+npm run api
 ```
 
-Hoac xoa thang theo ten:
+Neu dung PM2:
 
 ```bash
-npm run profiles -- --delete-profile=seller-a
+pm2 start ecosystem.config.js
+pm2 logs playwright-shopee-api
+pm2 restart playwright-shopee-api
 ```
 
-Quan ly profile bang HTTP API:
+## Profile va auto switch
+
+Moi profile luu:
+
+- `name`, `profileDir`, `cdpPort`
+- `status`: `ready`, `cooldown`, `disabled`
+- `blockedUntil`
+- `failureCount`, `successCount`, `switchCount`
+- `lastErrorCode`, `lastErrorMessage`
+- `lastUsedAt`, `lastTaskAt`
+
+Khi worker gap cac loi sau, `stack.js` va `api-stack.js` co the auto doi profile:
+
+- `CAPTCHA_REQUIRED`
+- `LOGIN_REQUIRED`
+- `LOADING_ISSUE`
+- `CDP_DISCONNECTED`
+
+HTTP API quan ly profile:
 
 ```bash
 curl http://127.0.0.1:8080/profiles
@@ -205,41 +191,148 @@ curl -X POST http://127.0.0.1:8080/profiles/thanhhuy/recover
 curl -X POST http://127.0.0.1:8080/profiles/thanhhuy/default
 curl -X POST http://127.0.0.1:8080/profiles/thanhhuy/disable
 curl -X POST http://127.0.0.1:8080/profiles/thanhhuy/enable
-curl -X POST http://127.0.0.1:8080/profiles/thanhhuy/cooldown -H "Content-Type: application/json" -d '{"durationMs":600000}'
+curl -X POST http://127.0.0.1:8080/profiles/thanhhuy/cooldown \
+  -H "Content-Type: application/json" \
+  -d '{"durationMs":600000}'
 ```
 
-HTTP API da duoc chuan hoa response de frontend de dung hon:
+Xoa profile:
 
-- Thanh cong: luon co `ok: true`, `data`, va co the co them `meta`.
-- Loi: luon co `ok: false`, `error.code`, `error.message`, `error.details`.
-- De giu tuong thich nguoc, cac field cu nhu `task`, `tasks`, `profiles`, `type`, `message` van duoc giu o top-level.
+```bash
+npm run profiles
+npm run profiles -- --delete-profile=seller-a
+```
 
-Toi uu hien tai:
+## Crawl flow hien tai
 
-- `GET /product/:itemId?stale=1`: neu DB da co ban ghi cu, API co the tra ngay du lieu store hit va tu revalidate nen.
-- `POST /products/batch` ho tro `{"stale": true}` hoac `?stale=1` voi y nghia tuong tu.
-- `server.js` da duoc doi sang provider facade (`providers/shopee/index.js`) de giam coupling vao parser/normalizer Shopee.
+Server nhan request bang `url` hoac `itemId`, tao task, day vao queue, roi worker xu ly.
 
-Vi du:
+Worker uu tien flow nhanh:
+
+1. tach `itemId` tu input
+2. goi thang affiliate API trong browser context qua `fetch(...)`
+3. neu khong lay duoc response hop le thi fallback sang `goto https://affiliate.shopee.vn/offer/product_offer/<itemId>`
+4. cho response `api/v3/offer/product`
+5. gui raw JSON ve `server.js`
+6. `server.js` normalize thanh output gon
+
+Format input hop le:
+
+- `57458114650`
+- `https://shopee.vn/product/<shop_id>/<item_id>`
+- SEO URL kieu `...-i.<shop_id>.<item_id>`
+- URL co query `item_id=<item_id>`
+
+## HTTP API
+
+### Health va session
+
+```bash
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/session
+curl http://127.0.0.1:8080/queue
+```
+
+- `/health`: worker count, queue size, product store driver
+- `/session`: them `latestWorkerSession`, profile summary, cache size
+- `/queue`: thong tin queue driver + task dang `queued/running`
+
+### Scrape task API
+
+Theo link:
+
+```bash
+curl -X POST http://127.0.0.1:8080/scrape \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://shopee.vn/product/344837665/57458114650"}'
+```
+
+Theo `itemId`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/scrape \
+  -H "Content-Type: application/json" \
+  -d '{"itemId":"57458114650"}'
+```
+
+Chi queue task:
+
+```bash
+curl -X POST "http://127.0.0.1:8080/scrape?wait=0" \
+  -H "Content-Type: application/json" \
+  -d '{"itemId":"57458114650"}'
+```
+
+Task API:
+
+```bash
+curl http://127.0.0.1:8080/tasks
+curl http://127.0.0.1:8080/tasks/<task-id>
+curl -X POST http://127.0.0.1:8080/tasks/<task-id>/cancel
+curl -X DELETE http://127.0.0.1:8080/tasks/<task-id>
+```
+
+### Product API
+
+```bash
+curl http://127.0.0.1:8080/product/57458114650
+curl "http://127.0.0.1:8080/product/57458114650?mode=compact"
+curl "http://127.0.0.1:8080/product/57458114650?mode=full"
+curl "http://127.0.0.1:8080/product/57458114650?mode=raw"
+curl "http://127.0.0.1:8080/product/57458114650?refresh=1"
+curl "http://127.0.0.1:8080/product/57458114650?stale=1"
+```
+
+Batch:
+
+```bash
+curl -X POST http://127.0.0.1:8080/products/batch \
+  -H "Content-Type: application/json" \
+  -d '{"itemIds":["57458114650","20300919760"],"mode":"compact"}'
+```
+
+Batch co the nhan `itemIds`, `items`, hoac `urls`.
+
+### Product store API
+
+Chi co y nghia khi:
+
+```env
+PRODUCT_STORE_DRIVER=file
+```
+
+Khi do co them:
+
+```bash
+curl http://127.0.0.1:8080/products
+curl http://127.0.0.1:8080/products/57458114650/history
+```
+
+File store local:
+
+- `data/products.json`
+- `data/price-history.jsonl`
+- `data/task-history.json`
+
+## Response shape
+
+HTTP response success hien tai duoc normalize boi `sendHttpJson()`:
+
+- success thuong co dang `{ "data": { ... } }`
+- error co dang `{ "ok": false, "error": { "code", "message", "details" }, ... }`
+
+Vi du success:
 
 ```json
 {
-  "ok": true,
   "data": {
-    "task": {
-      "taskId": "abc",
-      "status": "queued"
-    }
-  },
-  "task": {
-    "taskId": "abc",
-    "status": "queued"
-  },
-  "meta": {
-    "endpoint": "/scrape"
+    "type": "SUCCESS",
+    "message": "Crawl thanh cong"
   }
 }
 ```
+
+Vi du error:
 
 ```json
 {
@@ -250,295 +343,110 @@ Vi du:
     "details": {
       "taskId": "abc"
     }
-  },
-  "message": "Khong tim thay task",
-  "errorCode": "ERROR",
-  "taskId": "abc"
+  }
 }
 ```
 
-Hoac chon thang theo ten:
+## Output JSON sau khi normalize
+
+Raw response Shopee Affiliate se duoc map thanh object gon:
+
+```json
+{
+  "productID": "20300919760",
+  "price": 2186000,
+  "minPrice": 2186000,
+  "maxPrice": 4097000,
+  "sales": 623,
+  "totalSales": 1200,
+  "rating": "4.85",
+  "imageUrl": "https://cf.shopee.vn/file/...",
+  "shopId": "174420235",
+  "shopName": "HONALIFE VN",
+  "commission": 196740,
+  "hasExtraCommission": true,
+  "extraCommission": 109300,
+  "hasShopeeCommission": true,
+  "shopeeCommission": 40000,
+  "productLink": "https://shopee.vn/product/174420235/20300919760",
+  "productName": "..."
+}
+```
+
+Parser se fail neu thieu `productID`, `productName`, hoac `productLink`.
+
+## Queue, retry, cache, store
+
+### Queue
+
+- `memory`: default, queue nam trong process
+- `bullmq`: queue persistence tren Redis
+
+Neu `QUEUE_DRIVER=bullmq` ma init loi, server co the fallback ve `QUEUE_DRIVER_FALLBACK`.
+
+### Retry
+
+Retry tu dong khi worker tra ve:
+
+- `WORKER_ERROR`
+- `CDP_DISCONNECTED`
+
+Task response co `retryCount`, `maxRetries`, `nextAttemptAt`.
+
+### Cache
+
+RAM cache chi hoat dong khi:
+
+```env
+PRODUCT_CACHE_TTL_MS > 0
+```
+
+### Store local
+
+Chi luu khi:
+
+```env
+PRODUCT_STORE_DRIVER=file
+```
+
+Store local phu hop de debug output, xem lich su gia/commission, va giu task history sau restart.
+
+## Loi hay gap
+
+### Worker khong len
 
 ```bash
-npm run login -- --profile=seller-a
-npm run stack -- --profile=seller-a
-npm run api -- --profile=seller-a
+curl http://127.0.0.1:8080/health
 ```
 
----
+Neu `workerClients = 0` thi thu mo lai Chrome CDP, chay lai `npm run stack`, va mo san dashboard affiliate.
 
-# Chay lan dau
+### `connect ECONNREFUSED`
 
-Nen dung Chrome that qua CDP de giam loi captcha/loading issue.
-
-## 1. Chon profile
-
-Neu muon tao hoac doi profile truoc khi login:
+Chrome chua mo hoac sai port:
 
 ```bash
-npm run profiles
+google-chrome --remote-debugging-port=9222 --user-data-dir=.profiles/default
 ```
 
-Hoac chay thang lenh login/stack, script se hoi profile truoc khi mo.
+### Bi captcha / loading issue / verify traffic
 
-## Lưu ý quan trọng tránh bị khóa acc (quan trọng quan trọng cực quan trọng):
+Repo khong bypass captcha. Can quay lai cua so Chrome that, xu ly bang tay, vao lai affiliate, roi neu can thi restart `npm run stack`.
 
-- Sau khi tạo profile mới, uu tien dang nhap Shopee truoc va xu ly captcha cho on dinh.
-- Khi chay `npm run stack`, neu Shopee bi day ve captcha/verify thi cu xu ly bang tay tren tab Shopee; khi Shopee da vao binh thuong thi nhan `Enter` de tool mo tiep trang Affiliate.
+### Task dung o `queued`
 
-## 2. Mo Chrome CDP
-
-Mo terminal rieng va chay:
+Thuong do worker chua connect, queue dang cho retry, hoac server vua khoi dong lai.
 
 ```bash
-google-chrome --remote-debugging-port=<PORT_CUA_PROFILE> --user-data-dir=<THU_MUC_PROFILE>
+curl http://127.0.0.1:8080/queue
+curl http://127.0.0.1:8080/session
 ```
 
-Vi du neu profile dang chon la `thanhhuy2` va duoc gan port `9223`:
+## Kiem tra source
 
 ```bash
-google-chrome --remote-debugging-port=9223 --user-data-dir=.profiles/thanhhuy2
+npm run check
+npm run test
 ```
 
-Giu terminal nay dang chay. Chrome mo ra tu lenh nay se dung profile rieng tai thu muc da chon.
-
-Neu ban chay `npm run login` hoac `npm run stack` sau khi chon profile, tool cung co the tu thu mo Chrome CDP voi dung port/profile cua profile do.
-Neu `npm run stack` mo Shopee va gap captcha, tool se dung lai de ban xu ly bang tay. Sau khi Shopee on dinh, nhan `Enter` de tool mo tiep tab Affiliate va start worker.
-
-## 3. Dang nhap profile Chrome
-
-Trong cua so Chrome vua mo:
-
-- Dang nhap tai khoan Google/Chrome profile neu can.
-- Khong dung Chrome profile dang mo san o cua so khac.
-- Sau khi dang nhap xong, giu nguyen cua so Chrome nay.
-
-## 4. Dang nhap Shopee truoc
-
-Trong cung cua so Chrome do, mo:
-
-```text
-https://shopee.vn
-```
-
-Sau do:
-
-- Dang nhap tai khoan Shopee.
-- Neu co captcha hoac verify thi xu ly bang tay.
-- Cho den khi vao Shopee binh thuong, khong con bi day ve trang captcha/loading issue.
-
-Buoc nay rat quan trong vi Shopee hay chan neu vao Affiliate ngay khi session Shopee chua on dinh.
-
-## 5. Dang nhap Shopee Affiliate
-
-Sau khi Shopee da on dinh, tool se mo tiep:
-
-```text
-https://affiliate.shopee.vn/dashboard
-```
-
-Sau do:
-
-- Dang nhap tai khoan Affiliate neu duoc yeu cau.
-- Xu ly captcha neu co.
-- Cho dashboard dung yen vai phut, khong bi da lai ve login/captcha/loading issue thi nhan `Ctrl+C`.
-
-## 6. Kiem tra Playwright attach vao Chrome
-
-Trong file `.env`, can co:
-
-```bash
-BROWSER_CDP_URL=http://127.0.0.1:9222
-```
-
-Gia tri trong `.env` la port goc. Profile dau tien thuong dung `9222`, profile tiep theo co the la `9223`, `9224`... Script se tu doi sang port cua profile dang chon khi chay qua `npm run login`, `npm run stack`, `npm run api`.
-
-## Xoa profile
-
-Xoa bang menu:
-
-```bash
-npm run profiles
-```
-
-Trong menu, nhan `D` de chon profile can xoa.
-
-Xoa thang bang command:
-
-```bash
-npm run profiles -- --delete-profile=thanhhuy2
-```
-
-Luu y:
-
-- Lenh xoa se xoa ca thu muc du lieu cua profile trong `.profiles/`.
-- Khong the xoa profile cuoi cung.
-- Neu xoa profile mac dinh, he thong se tu chon profile con lai dau tien lam mac dinh moi.
-- He thong moi se luu profile tap trung trong `.profiles/`.
-
-Sau khi Chrome da login Shopee va Affiliate xong, co the chay:
-
-```bash
-npm run login
-```
-
-Neu muon login vao profile cu the:
-
-```bash
-npm run login -- --profile=seller-a
-```
-
-Lenh nay chi dung de kiem tra profile da san sang. Neu da vao duoc dashboard Affiliate thi nhan `Ctrl+C`.
-
-Neu dung CDP thi session se nam trong profile Chrome:
-
----
-
-# Chay he thong
-
-```bash
-npm run stack
-```
-
-Neu muon crawl bang profile cu the:
-
-```bash
-npm run stack -- --profile=seller-a
-```
-
-Lenh nay se tu dong:
-
-- Khoi dong HTTP server
-- Khoi dong Playwright worker
-- Cho worker san sang
-
-Neu muon chay API nen:
-
-```bash
-npm run api
-```
-
-Neu muon chay API voi profile cu the:
-
-```bash
-npm run api -- --profile=seller-a
-```
-
-Lenh nay se:
-
-- Kiem tra/mo Chrome CDP neu `BROWSER_CDP_URL` duoc set.
-- Khoi dong HTTP server.
-- Khoi dong Playwright worker.
-- Tu restart server/worker neu process bi crash.
-- Phu hop de tool khac goi HTTP API.
-
-Neu co PM2:
-
-```bash
-pm2 start ecosystem.config.js
-pm2 logs playwright-shopee-api
-pm2 restart playwright-shopee-api
-```
-
----
-
-# HTTP API
-
-Theo link:
-
-```bash
-curl -X POST http://localhost:8080/scrape \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://shopee.vn/product/344837665/57458114650"}'
-```
-
-Theo item id:
-
-```bash
-curl -X POST http://localhost:8080/scrape \
-  -H "Content-Type: application/json" \
-  -d '{"itemId":"57458114650"}'
-```
-
-Lay danh sach task:
-
-```bash
-curl http://localhost:8080/tasks
-```
-
-Lay chi tiet task:
-
-```bash
-curl http://localhost:8080/tasks/<task-id>
-```
-
-Lay nhanh theo item id. Mac dinh van crawl moi qua worker vi cache/store dang tat:
-
-```bash
-curl "http://localhost:8080/product/57458114650"
-```
-
-Neu sau nay ban bat lai cache/store, co the ep crawl lai bang `refresh=1`:
-
-```bash
-curl "http://localhost:8080/product/57458114650?refresh=1"
-```
-
-Chon format ket qua:
-
-```bash
-curl "http://localhost:8080/product/57458114650?mode=compact"
-curl "http://localhost:8080/product/57458114650?mode=full"
-curl "http://localhost:8080/product/57458114650?mode=raw"
-```
-
-Lay nhieu product mot lan:
-
-```bash
-curl -X POST http://localhost:8080/products/batch \
-  -H "Content-Type: application/json" \
-  -d '{"itemIds":["57458114650","20300919760"],"mode":"compact"}'
-```
-
-Kiem tra session worker/CDP/cache:
-
-```bash
-curl http://localhost:8080/session
-```
-
-Kiem tra queue driver va task dang cho:
-
-```bash
-curl http://localhost:8080/queue
-```
-
-Huy task dang queued/running:
-
-```bash
-curl -X POST http://localhost:8080/tasks/<task-id>/cancel
-```
-
-Xoa task khoi RAM:
-
-```bash
-curl -X DELETE http://localhost:8080/tasks/<task-id>
-```
-
-# Ghi chu
-
-- Chi can chay `npm run login` khi:
-  - Chua tung dang nhap.
-  - Session Affiliate het han.
-
-- Su dung hang ngay chi can:
-
-```bash
-npm run stack
-```
-
-- Worker van su dung session Affiliate that.
-- Neu session het han, worker se bao loi login va chi can chay lai:
-
-```bash
-npm run login
-```
+`npm run check` se parse syntax cac file JS chinh. `npm run test` chay test cho `validation`, `input`, `normalize-product`, `task-store`, `task-presenter`, `product-store`.
